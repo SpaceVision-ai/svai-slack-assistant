@@ -1,0 +1,18 @@
+# Environments
+.env
+.venv/
+
+# Secrets
+*.json
+
+# Caches and temporary files
+.channels_cache.json
+.users_cache.json
+*.swp
+
+# Gemini session logs
+.gemini_session/
+
+# Python caches
+__pycache__/
+*.pyc
