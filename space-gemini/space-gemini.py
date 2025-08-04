@@ -16,8 +16,9 @@ import re
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# Load environment variables from .env file
-load_dotenv(dotenv_path="../.env")
+# .env 파일 (봇 특정 및 공통) 로드
+load_dotenv() # 현재 디렉터리의 .env 로드
+load_dotenv(dotenv_path="../.env") # 상위 디렉터리의 .env 로드
 
 SLACK_BOT_TOKEN = os.environ.get("SLACK_BOT_TOKEN")
 

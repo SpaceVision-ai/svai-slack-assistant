@@ -7,8 +7,9 @@ from slack_bolt.adapter.socket_mode import SocketModeHandler
 import vertexai
 from vertexai.generative_models import GenerativeModel
 
-# .env 파일에서 환경 변수 로드
-load_dotenv(dotenv_path="../.env")
+# .env 파일 (봇 특정 및 공통) 로드
+load_dotenv() # 현재 디렉터리의 .env 로드
+load_dotenv(dotenv_path="../.env") # 상위 디렉터리의 .env 로드
 
 # 로깅 설정
 logging.basicConfig(level=logging.INFO)
@@ -92,15 +93,20 @@ def handle_translate_command(ack, command, say):
 def handle_message_events(body, logger):
     event = body.get('event', {})
     channel_id = event.get('channel')
+    channel_type = event.get('channel_type') # 'im' for DMs
     user_id = event.get('user')
     text = event.get('text')
     ts = event.get('ts')
 
-    # 봇 자신의 메시지이거나, 등록되지 않은 채널의 메시지는 무시
-    if event.get('bot_id') or not channel_manager.is_channel_registered(channel_id):
+    # 봇 자신의 메시지는 무시
+    if event.get('bot_id'):
         return
 
-    # 텍스트가 없는 메시지는 무시 (예: 파일 공유만 있는 경우)
+    # 등록된 채널이거나 DM이 아니면 무시
+    if not (channel_manager.is_channel_registered(channel_id) or channel_type == 'im'):
+        return
+
+    # 텍스트가 없는 메시지는 무시
     if not text:
         return
 
@@ -108,25 +114,25 @@ def handle_message_events(body, logger):
         # Gemini를 사용하여 번역 수행
         prompt = f"You are a translator. First, detect if the following text is Korean or English. If it is Korean, translate it to English. If it is English, translate it to Korean. Do not add any other text to the response, only the translated text itself. Text to translate: {text}"
         response = model.generate_content(prompt)
-        translated_text = response.text
+        translated_text = response.text.strip()
 
         # 원본 언어 감지 (간단한 방법)
-        original_lang = "한국어" if any(c >= '\uac00' and c <= '\ud7a3' for c in text) else "English"
+        is_korean = any(c >= '\uac00' and c <= '\ud7a3' for c in text)
         
-        if original_lang == "한국어":
+        if is_korean:
             reply_text = f"🌐 **Translation (EN):**\n\n{translated_text}"
         else:
             reply_text = f"🌐 **번역 (KR):**\n\n{translated_text}"
 
-        # 스레드에 번역 결과 게시
-        app.client.chat_postMessage(
-            channel=channel_id,
-            text=reply_text,
-            thread_ts=ts
-        )
+        # 채널에서는 스레드에, DM에서는 일반 메시지로 응답
+        if channel_type == 'im':
+            app.client.chat_postMessage(channel=channel_id, text=reply_text)
+        else:
+            app.client.chat_postMessage(channel=channel_id, text=reply_text, thread_ts=ts)
 
     except Exception as e:
         logger.error(f"Error during translation: {e}")
+
 
 # 앱 시작
 

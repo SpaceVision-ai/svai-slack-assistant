@@ -1,6 +1,14 @@
 # Environments
 .env
 .venv/
+.idea/
+.vscode/
+__pycache__/
+*.pyc
+
+# Environment variables
+.env
+**/.env
 
 # Secrets
 *.json
