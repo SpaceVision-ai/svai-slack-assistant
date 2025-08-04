@@ -1,3 +1,5 @@
 slack_bolt
 python-dotenv
 google-cloud-aiplatform
+notion-client
+notion-client
