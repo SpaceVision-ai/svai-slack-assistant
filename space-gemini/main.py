@@ -17,7 +17,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(level
 logger = logging.getLogger(__name__)
 
 # Load environment variables from .env file
-load_dotenv()
+load_dotenv(dotenv_path="../.env")
 
 SLACK_BOT_TOKEN = os.environ.get("SLACK_BOT_TOKEN")
 
