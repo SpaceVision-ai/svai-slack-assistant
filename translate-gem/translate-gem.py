@@ -91,43 +91,60 @@ def handle_translate_command(ack, command, say, logger):
         logger.error(f"Error handling /translate-gem-channel command: {e}")
         say(f"An error occurred while processing your command: {e}")
 
-@app.event("message")
-def handle_message_events(body, logger):
-    event = body.get('event', {})
+@app.event("member_joined_channel")
+def handle_member_joined_channel(event, say, logger):
     channel_id = event.get('channel')
     channel_type = event.get('channel_type')
+    user_id = event.get('user')
+    
+    # Check if the joined user is the bot itself and if it's a group DM
+    if user_id == app.client.auth_test()["user_id"] and channel_type == 'mpim':
+        try:
+            say(
+                channel=channel_id,
+                text="Hello! I\'ve been invited to this direct message channel and will now automatically translate messages. No extra commands needed!"
+            )
+            logger.info(f"Joined and sent welcome message to mpim channel: {channel_id}")
+        except Exception as e:
+            logger.error(f"Failed to send welcome message to {channel_id}: {e}")
+
+def should_translate(event):
+    """Determine if a message should be translated."""
+    channel_id = event.get('channel')
+    channel_type = event.get('channel_type')
+    
+    # Ignore messages from bots or with no text
+    if event.get('bot_id') or not event.get('text'):
+        return False
+        
+    # Translate if it\'s a registered channel, a 1:1 DM, or a group DM
+    return channel_manager.is_channel_registered(channel_id) or channel_type in ['im', 'mpim']
+
+def translate_message(event, say, logger):
+    """Translate a message and post it."""
+    channel_id = event.get('channel')
+    user_id = event.get('user')
     text = event.get('text')
     ts = event.get('ts')
-
-    if event.get('bot_id') or not text:
-        return
-
-    if not (channel_manager.is_channel_registered(channel_id) or channel_type == 'im'):
-        return
+    thread_ts = event.get("thread_ts", ts) # Use thread_ts if available, otherwise use message ts
 
     thinking_response = None
     try:
-        # 1. Post a public "thinking" message
+        # 1. Post a public "thinking" message in a thread
         thinking_messages = [
-            "Interpreting Heptapod Language…",
-            "Translating to Mentalese…",
-            "Analyzing linguistic patterns…",
-            "Connecting to the universal translator…"
+            "Interpreting Heptapod Language…", "Translating to Mentalese…",
+            "Analyzing linguistic patterns…", "Connecting to the universal translator…"
         ]
         thinking_message_text = random.choice(thinking_messages)
         
-        # For DMs, post directly. For channels, post in a thread.
-        thread_ts_for_thinking = ts if channel_type != 'im' else None
-        
-        thinking_response = app.client.chat_postMessage(
-            channel=channel_id,
+        thinking_response = say(
             text=f":thought_balloon: {thinking_message_text}",
-            thread_ts=thread_ts_for_thinking
+            thread_ts=thread_ts
         )
-        logger.info(f"Posted thinking message at ts: {thinking_response['ts']}")
+        logger.info(f"Posted thinking message in thread {thread_ts} at ts: {thinking_response['ts']}")
 
         # 2. Perform the translation
-        prompt = f"You are a translator. Detect the language of the following text. If it is Korean, translate it to English. For all other languages, translate it to Korean. Do not add any other text to the response, only the translated text itself. Text to translate: {text}"
+        prompt = f"You are a translator. Detect the language of the following text. If it is Korean, translate it to English. For all other languages, translate it to Korean. Please format the translation using Slack\'s markdown syntax for optimal display (e.g., use *bold* instead of **bold**). Do not add any other text to the response, only the translated text itself. Text to translate: {text}"
         
         translation_response = model.generate_content(prompt)
         translated_text = translation_response.text.strip()
@@ -136,9 +153,15 @@ def handle_message_events(body, logger):
         is_korean = any(c >= '\uac00' and c <= '\ud7a3' for c in text)
         
         if is_korean:
-            reply_text = f"🌐 Translation (EN):\n\n{translated_text}"
+            reply_text = f"""<@{user_id}> said:
+🌐 Translation (EN):
+
+{translated_text}"""
         else:
-            reply_text = f"🌐 번역 (KR):\n\n{translated_text}"
+            reply_text = f"""<@{user_id}>님이 말했습니다:
+🌐 번역 (KR):
+
+{translated_text}"""
 
         # 3. Update the thinking message with the final result
         app.client.chat_update(
@@ -150,7 +173,6 @@ def handle_message_events(body, logger):
 
     except Exception as e:
         logger.error(f"Error during translation process: {e}")
-        # If an error occurs, update the thinking message with an error notification
         if thinking_response and thinking_response.get('ts'):
             app.client.chat_update(
                 channel=channel_id,
@@ -158,7 +180,27 @@ def handle_message_events(body, logger):
                 text=f"Sorry, an error occurred during translation: {e}"
             )
 
-
+@app.event("message")
+def handle_message_events(body, say, logger):
+    event = body.get('event', {})
+    # Handle message edits (subtype 'message_changed') within the main message handler
+    if event.get("subtype") == "message_changed":
+        message = event.get("message", {})
+        # To avoid loops, ensure the user who changed the message is not the bot itself
+        if message.get("user") != app.client.auth_test()["user_id"]:
+             # Re-use the event structure for the translation function
+            event_for_translation = {
+                "channel": event.get("channel"),
+                "channel_type": event.get("channel_type"),
+                "user": message.get("user"),
+                "text": message.get("text"),
+                "ts": message.get("ts"),
+                "thread_ts": event.get("thread_ts", message.get("ts"))
+            }
+            if should_translate(event_for_translation):
+                translate_message(event_for_translation, say, logger)
+    elif should_translate(event):
+        translate_message(event, say, logger)
 
 if __name__ == "__main__":
     logger.info("Starting bot...")
