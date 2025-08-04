@@ -178,8 +178,28 @@ def handle_app_mention_events(body, say, logger):
         user_text = event.get("text", "").lower()
         channel_id = event["channel"]
         message_ts = event.get("ts")
-        # This key exists if the mention is in a thread.
-        thread_ts = event.get("thread_ts") 
+        thread_ts = event.get("thread_ts")
+
+        HELP_KEYWORDS = ["뭐 할 수 있어", "도와줘", "help", "기능", "what can you do"]
+        is_help_request = any(keyword in user_text for keyword in HELP_KEYWORDS)
+
+        if is_help_request:
+            help_text = (
+                "안녕하세요! 저는 Gemini AI 봇입니다. 제가 할 수 있는 일은 다음과 같아요. 🤖\n\n"
+                "🔹 **질문 답변**\n"
+                "   - 저를 멘션하고 무엇이든 질문하시면 답변해 드려요.\n\n"
+                "🔹 **파일 처리**\n"
+                "   - 이미지, PDF, DOCX, 텍스트 파일을 첨부하고 질문하시면 내용을 분석하고 답변해 드려요.\n"
+                "   - 예: `이 문서 요약해 줘`, `이 이미지에 대해 설명해 줘`\n\n"
+                "🔹 **대화 요약**\n"
+                "   - **스레드 요약:** 특정 메시지의 스레드(댓글) 안에서 저를 멘션하고 `요약` 또는 `정리`라고 요청하시면 해당 스레드의 대화 내용을 요약해 드려요.\n"
+                "   - **채널 요약:** 채널에서 저를 멘션하고 `요약` 또는 `정리`라고 요청하시면 최근 채널 대화 내용을 요약해 드려요.\n\n"
+                "🔹 **DM (개인 메시지)**\n"
+                "   - 저와의 DM에서는 멘션 없이 바로 대화하거나 파일을 처리할 수 있어요.\n\n"
+                "궁금한 점이 있다면 언제든지 물어보세요!"
+            )
+            say(text=help_text, thread_ts=message_ts, channel=channel_id)
+            return
 
         SUMMARY_KEYWORDS = ["요약", "정리", "summarize", "recap"]
         is_summary_request = any(keyword in user_text for keyword in SUMMARY_KEYWORDS)
