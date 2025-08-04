@@ -218,36 +218,58 @@ def translate_message(event, say, logger):
             thread_ts=thread_ts
         )
 
-        # 2. Perform the translation
-        prompt = f"You are a translator. Detect the language of the following text. If it is Korean, translate it to English. For all other languages, translate it to Korean. Please format the translation using Slack's markdown syntax for optimal display (e.g., use *bold* instead of **bold**). Do not add any other text to the response, only the translated text itself. Text to translate: {text}"
-        
-        translation_response = model.generate_content(prompt)
-        translated_text = translation_response.text.strip()
+        # 2. Separate URL from the text
+        url_pattern = r"http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\(\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+"
+        urls = re.findall(url_pattern, text)
+        text_to_translate = re.sub(url_pattern, "", text).strip()
+
+        # 3. Perform the translation only if there is text to translate
+        if text_to_translate:
+            prompt = f"You are a translator. Detect the language of the following text. If it is Korean, translate it to English. For all other languages, translate it to Korean. Please format the translation using Slack's markdown syntax for optimal display (e.g., use *bold* instead of **bold**). Do not add any other text to the response, only the translated text itself. Text to translate: {text_to_translate}"
+            
+            translation_response = model.generate_content(prompt)
+            translated_text = translation_response.text.strip()
+        else:
+            translated_text = ""
+
+        # 4. Combine translated text with the original URLs
+        final_translated_text = f"{translated_text} {' '.join(urls)}".strip()
 
         is_korean = any(c >= '가' and c <= '힣' for c in text)
         if is_korean:
-            reply_text = f"🌐 *Translation (EN):*\n<@{user_id}> {translated_text}"
+            reply_text = f"🌐 *Translation (EN):*\n<@{user_id}> {final_translated_text}"
         else:
-            reply_text = f"🌐 *번역 (KR):*\n<@{user_id}> {translated_text}"
+            reply_text = f"🌐 *번역 (KR):*\n<@{user_id}> {final_translated_text}"
 
-        # 3. Update the thinking message with the final result
+        # 5. Update the thinking message with the final result
         app.client.chat_update(
             channel=channel_id,
             ts=thinking_response['ts'],
             text=reply_text
         )
         
-        # 4. NEW: Check for Notion link and ask to translate the document
+        # 6. NEW: Check for Notion link and ask to translate the document
         page_id = get_page_id_from_url(text)
         if page_id:
             logger.info(f"Found a Notion Page ID in the translated message: {page_id}")
             try:
                 page = notion.pages.retrieve(page_id=page_id)
-                title_property = page.get('properties', {}).get('title', {})
-                original_title = title_property.get('title', [{}])[0].get('plain_text', 'Untitled')
+                
+                # Find the title property by its type
+                properties = page.get('properties', {})
+                title_property = None
+                for prop in properties.values():
+                    if prop.get('type') == 'title':
+                        title_property = prop
+                        break
+                
+                if title_property:
+                    original_title = title_property.get('title', [{}])[0].get('plain_text', 'Untitled')
+                else:
+                    original_title = 'Untitled'
                 
                 # Ask to translate the document in the original message's thread
-                ask_to_translate_document(say, channel_id, ts, page_id, original_title)
+                ask_to_translate_document(say, channel_id, thinking_response['ts'], page_id, original_title)
             except Exception as e:
                 logger.error(f"Error handling Notion link after translation: {e}")
                 say(channel=channel_id, thread_ts=ts, text=f":warning: Notion 링크 처리 중 오류가 발생했습니다:```{e}```")
@@ -261,6 +283,7 @@ def translate_message(event, say, logger):
                 text=f"Sorry, an error occurred during translation: {e}"
             )
 
+
 @app.event("message")
 def handle_message_events(body, say, logger):
     event = body.get('event', {})
@@ -270,8 +293,8 @@ def handle_message_events(body, say, logger):
     if event.get("bot_id"):
         return
     
-    is_bot_id = event.get("message", {}).get("bot_id") or event.get("message", {}).get("attachments", [{}])[0].get("bot_id")
-    if event.get("subtype") == "message_changed" and is_bot_id:
+    # is_bot_id = event.get("message", {}).get("bot_id") or event.get("message", {}).get("attachments", [{}])[0].get("bot_id")
+    if event.get("subtype") == "message_changed": #and is_bot_id:
         logger.info(">>> skip because the message is made by bot")
         return
     # --- End of Check ---
@@ -281,20 +304,20 @@ def handle_message_events(body, say, logger):
         if should_translate(event_data):
             translate_message(event_data, say, logger)
 
-    if event.get("subtype") == "message_changed":
-        message = event.get("message", {})
-        if message.get("user"):
-            event_for_translation = {
-                "channel": event.get("channel"),
-                "channel_type": event.get("channel_type"),
-                "user": message.get("user"),
-                "text": message.get("text"),
-                "ts": message.get("ts"),
-                "thread_ts": event.get("thread_ts", message.get("ts")),
-            }
-            process_event(event_for_translation)
-    else:
-        process_event(event)
+    # if event.get("subtype") == "message_changed":
+    #     message = event.get("message", {})
+    #     if message.get("user"):
+    #         event_for_translation = {
+    #             "channel": event.get("channel"),
+    #             "channel_type": event.get("channel_type"),
+    #             "user": message.get("user"),
+    #             "text": message.get("text"),
+    #             "ts": message.get("ts"),
+    #             "thread_ts": event.get("thread_ts", message.get("ts")),
+    #         }
+    #         process_event(event_for_translation)
+    # else:
+    process_event(event)
 
 if __name__ == "__main__":
     logger.info("Starting bot...")
