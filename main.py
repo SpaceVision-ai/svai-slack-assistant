@@ -185,9 +185,11 @@ def handle_app_mention_events(body, say, logger):
         is_summary_request = any(keyword in user_text for keyword in SUMMARY_KEYWORDS)
 
         if is_summary_request:
+            user_id = event["user"]
+            user_name = get_user_info(user_id)
             # --- THREAD SUMMARIZATION LOGIC ---
             if thread_ts:
-                thinking_message = say(text="스레드 댓글들을 읽고 요약하는 중입니다... 🧐", thread_ts=thread_ts, channel=channel_id)
+                thinking_message = say(text=f"네, {user_name}님. 요청하신 스레드 댓글들을 읽고 요약하는 중입니다... 🧐", thread_ts=thread_ts, channel=channel_id)
                 try:
                     # Fetch up to 151 replies to check if there are more than 150
                     history_response = app.client.conversations_replies(channel=channel_id, ts=thread_ts, limit=151)
@@ -210,9 +212,8 @@ def handle_app_mention_events(body, say, logger):
                         return
 
                     summary_prompt = (
-                        f"당신은 대화 요약 전문가입니다. "
-                        f"아래에 제공되는 Slack 스레드의 댓글들을 분석하여 핵심 사항을 요약해주세요. "
-                        f"사용자의 원래 요청사항도 참고하여 답변을 구성해주세요.\n\n"
+                        f"다음 Slack 스레드 대화 내용을 요약해 주세요. "
+                        f"다른 부가적인 설명 없이 요약된 내용만 제공해야 합니다.\n\n"
                         f"--- 사용자의 요청사항 ---\n{event.get('text')}\n\n"
                         f"--- 스레드 댓글 내용 ---\n{formatted_history}"
                     )
@@ -235,9 +236,8 @@ def handle_app_mention_events(body, say, logger):
                         return
 
                     summary_prompt = (
-                        f"당신은 대화 요약 전문가입니다. "
-                        f"아래에 제공되는 Slack 채널의 대화 내용을 분석하여 핵심 사항을 요약해주세요. "
-                        f"사용자의 원래 요청사항도 참고하여 답변을 구성해주세요.\n\n"
+                        f"다음 Slack 채널의 대화 내용을 요약해 주세요. "
+                        f"다른 부가적인 설명 없이 요약된 내용만 제공해야 합니다.\n\n"
                         f"--- 사용자의 요청사항 ---\n{event.get('text')}\n\n"
                         f"--- 채널 대화 내용 ---\n{formatted_history}"
                     )
