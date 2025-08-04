@@ -123,14 +123,18 @@ def should_translate(event):
 def translate_message(event, say, logger):
     """Translate a message and post it."""
     channel_id = event.get('channel')
+    channel_type = event.get('channel_type')
     user_id = event.get('user')
     text = event.get('text')
     ts = event.get('ts')
-    thread_ts = event.get("thread_ts", ts) # Use thread_ts if available, otherwise use message ts
+    
+    # Determine if the reply should be in a thread
+    in_thread = channel_type not in ['im', 'mpim']
+    thread_ts = ts if in_thread else None
 
     thinking_response = None
     try:
-        # 1. Post a public "thinking" message in a thread
+        # 1. Post a public "thinking" message
         thinking_messages = [
             "Interpreting Heptapod Language…", "Translating to Mentalese…",
             "Analyzing linguistic patterns…", "Connecting to the universal translator…"
@@ -141,10 +145,10 @@ def translate_message(event, say, logger):
             text=f":thought_balloon: {thinking_message_text}",
             thread_ts=thread_ts
         )
-        logger.info(f"Posted thinking message in thread {thread_ts} at ts: {thinking_response['ts']}")
+        logger.info(f"Posted thinking message at ts: {thinking_response['ts']}")
 
         # 2. Perform the translation
-        prompt = f"You are a translator. Detect the language of the following text. If it is Korean, translate it to English. For all other languages, translate it to Korean. Please format the translation using Slack\'s markdown syntax for optimal display (e.g., use *bold* instead of **bold**). Do not add any other text to the response, only the translated text itself. Text to translate: {text}"
+        prompt = f"You are a translator. Detect the language of the following text. If it is Korean, translate it to English. For all other languages, translate it to Korean. Please format the translation using Slack's markdown syntax for optimal display (e.g., use *bold* instead of **bold**). Do not add any other text to the response, only the translated text itself. Text to translate: {text}"
         
         translation_response = model.generate_content(prompt)
         translated_text = translation_response.text.strip()
@@ -152,16 +156,11 @@ def translate_message(event, say, logger):
 
         is_korean = any(c >= '\uac00' and c <= '\ud7a3' for c in text)
         
+        # Construct the reply text with mentions only for multi-person contexts
         if is_korean:
-            reply_text = f"""<@{user_id}> said:
-🌐 Translation (EN):
-
-{translated_text}"""
+            reply_text = f"🌐 *Translation (EN):*\n\n<@{user_id}> {translated_text}"
         else:
-            reply_text = f"""<@{user_id}>님이 말했습니다:
-🌐 번역 (KR):
-
-{translated_text}"""
+            reply_text = f"🌐 *번역 (KR):*\n\n<@{user_id}> {translated_text}"
 
         # 3. Update the thinking message with the final result
         app.client.chat_update(
@@ -179,6 +178,7 @@ def translate_message(event, say, logger):
                 ts=thinking_response['ts'],
                 text=f"Sorry, an error occurred during translation: {e}"
             )
+
 
 @app.event("message")
 def handle_message_events(body, say, logger):
