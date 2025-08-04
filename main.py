@@ -177,58 +177,86 @@ def handle_app_mention_events(body, say, logger):
         event = body["event"]
         user_text = event.get("text", "").lower()
         channel_id = event["channel"]
-        thread_ts = event.get("ts")
+        message_ts = event.get("ts")
+        # This key exists if the mention is in a thread.
+        thread_ts = event.get("thread_ts") 
 
-        # Keywords to trigger summarization
         SUMMARY_KEYWORDS = ["요약", "정리", "summarize", "recap"]
+        is_summary_request = any(keyword in user_text for keyword in SUMMARY_KEYWORDS)
 
-        if any(keyword in user_text for keyword in SUMMARY_KEYWORDS):
-            thinking_message = say(text="대화 내용을 읽고 요약하는 중입니다... 잠시만 기다려주세요. 🧐", thread_ts=thread_ts, channel=channel_id)
-            try:
-                history_response = app.client.conversations_history(channel=channel_id, limit=100) # Fetch last 100 messages
-                formatted_history = format_conversation_history(history_response)
-                
-                if not formatted_history:
-                    app.client.chat_update(channel=channel_id, ts=thinking_message["ts"], text="요약할 대화 내용을 찾지 못했어요. 😢")
-                    return
+        if is_summary_request:
+            # --- THREAD SUMMARIZATION LOGIC ---
+            if thread_ts:
+                thinking_message = say(text="스레드 댓글들을 읽고 요약하는 중입니다... 🧐", thread_ts=thread_ts, channel=channel_id)
+                try:
+                    # Fetch up to 151 replies to check if there are more than 150
+                    history_response = app.client.conversations_replies(channel=channel_id, ts=thread_ts, limit=151)
+                    messages = history_response.get("messages", [])
 
-                summary_prompt = (
-                    f"당신은 대화 요약 전문가입니다. "
-                    f"아래에 제공되는 Slack 대화 내용을 분석하여 핵심 사항, 주요 결정, 각 사람의 의견을 종합적으로 요약해주세요. "
-                    f"사용자의 원래 요청사항도 참고하여 답변을 구성해주세요.\n\n"
-                    f"--- 사용자의 요청사항 ---\n{event.get('text')}\n\n"
-                    f"--- 대화 내용 ---\n{formatted_history}"
-                )
+                    if len(messages) > 150:
+                        # Notify the user that the thread is too long and will be truncated
+                        app.client.chat_postMessage(
+                            channel=channel_id,
+                            thread_ts=thread_ts,
+                            text="⚠️ 스레드 댓글이 150개를 초과하여, 가장 최근 150개만 요약에 포함됩니다."
+                        )
+                        # Truncate the messages to the most recent 150
+                        history_response["messages"] = messages[:150]
 
-                response = model.generate_content(summary_prompt)
-                summary_text = response.text
+                    formatted_history = format_conversation_history(history_response)
+                    
+                    if not formatted_history:
+                        app.client.chat_update(channel=channel_id, ts=thinking_message["ts"], text="요약할 댓글을 찾지 못했어요. 😢")
+                        return
 
-                # Use Block Kit directly here to ensure proper formatting for summaries
-                blocks = [{
-                    "type": "section",
-                    "text": {
-                        "type": "mrkdwn",
-                        "text": summary_text or "(empty response)"
-                    }
-                }]
-                app.client.chat_update(
-                    channel=channel_id,
-                    ts=thinking_message["ts"],
-                    blocks=blocks,
-                    text="대화 요약이 완료되었습니다."
-                )
+                    summary_prompt = (
+                        f"당신은 대화 요약 전문가입니다. "
+                        f"아래에 제공되는 Slack 스레드의 댓글들을 분석하여 핵심 사항을 요약해주세요. "
+                        f"사용자의 원래 요청사항도 참고하여 답변을 구성해주세요.\n\n"
+                        f"--- 사용자의 요청사항 ---\n{event.get('text')}\n\n"
+                        f"--- 스레드 댓글 내용 ---\n{formatted_history}"
+                    )
+                    response = model.generate_content(summary_prompt)
+                    handle_gemini_response(app, channel_id, thinking_message, response.text, thread_ts=thread_ts)
 
-            except Exception as e:
-                logger.error(f"Error during summarization: {e}")
-                app.client.chat_update(channel=channel_id, ts=thinking_message["ts"], text=f"죄송합니다, 대화 내용을 가져오거나 요약하는 중 오류가 발생했어요: {e}")
+                except Exception as e:
+                    logger.error(f"Error during thread summarization: {e}")
+                    app.client.chat_update(channel=channel_id, ts=thinking_message["ts"], text=f"죄송합니다, 스레드 댓글을 가져오는 중 오류가 발생했어요: {e}")
+            
+            # --- CHANNEL SUMMARIZATION LOGIC ---
+            else:
+                thinking_message = say(text="채널 대화 내용을 읽고 요약하는 중입니다... 🧐", thread_ts=message_ts, channel=channel_id)
+                try:
+                    history_response = app.client.conversations_history(channel=channel_id, limit=100)
+                    formatted_history = format_conversation_history(history_response)
+
+                    if not formatted_history:
+                        app.client.chat_update(channel=channel_id, ts=thinking_message["ts"], text="요약할 대화 내용을 찾지 못했어요. 😢")
+                        return
+
+                    summary_prompt = (
+                        f"당신은 대화 요약 전문가입니다. "
+                        f"아래에 제공되는 Slack 채널의 대화 내용을 분석하여 핵심 사항을 요약해주세요. "
+                        f"사용자의 원래 요청사항도 참고하여 답변을 구성해주세요.\n\n"
+                        f"--- 사용자의 요청사항 ---\n{event.get('text')}\n\n"
+                        f"--- 채널 대화 내용 ---\n{formatted_history}"
+                    )
+                    response = model.generate_content(summary_prompt)
+                    handle_gemini_response(app, channel_id, thinking_message, response.text, thread_ts=message_ts)
+
+                except Exception as e:
+                    logger.error(f"Error during channel summarization: {e}")
+                    app.client.chat_update(channel=channel_id, ts=thinking_message["ts"], text=f"죄송합니다, 채널 대화 내용을 가져오는 중 오류가 발생했어요: {e}")
+        
+        # --- DEFAULT Q&A LOGIC ---
         else:
-            # Default behavior: Q&A and file processing
             process_event(event, say)
 
     except Exception as e:
         logger.error(f"Error in app_mention handler: {e}")
         event = body.get("event", {})
         say(text=f"An error occurred: {e}", thread_ts=event.get("ts"), channel=event.get("channel"))
+
 
 @app.event("message")
 def handle_direct_messages(body, say, logger):
