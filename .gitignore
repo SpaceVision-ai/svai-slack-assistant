@@ -140,4 +140,15 @@ cython_debug/
 
 # User-specific files
 .DS_Store
-*.png
+
+# Caches and local files
+.channels_cache.json
+.users_cache.json
+registered_channels.json
+translate-gem/registered_channels.json
+
+# Service account keys
+*-key.json
+
+# VS Code settings
+.vscode/

@@ -229,13 +229,19 @@ def translate_message(event, say, logger):
     channel_id = event.get('channel')
     user_id = event.get('user')
     text = event.get('text')
-    
-    # 원본 메시지가 스레드에 있는지 확인합니다.
+    original_ts = event.get('ts')
     thread_ts_from_event = event.get('thread_ts')
-    
+    channel_type = event.get('channel_type')
+
+    # 1. 번역 메시지를 보낼 스레드를 결정합니다.
+    translation_thread_ts = None
+    if channel_type not in ['im', 'mpim']:  # 공개/비공개 채널인 경우
+        translation_thread_ts = thread_ts_from_event or original_ts
+    # DM/MPIM인 경우, None으로 유지하여 새 메시지로 보냅니다.
+
     thinking_response = None
     try:
-        # 1. 모든 사용자에게 보이는 "생각 중" 메시지를 보냅니다.
+        # 2. 모든 사용자에게 보이는 "생각 중" 메시지를 보냅니다.
         thinking_messages = [
             "Interpreting Heptapod Language…", "Translating to Mentalese…",
             "Analyzing linguistic patterns…", "Connecting to the universal translator…"
@@ -244,31 +250,46 @@ def translate_message(event, say, logger):
         
         thinking_response = say(
             text=f":thought_balloon: {thinking_message_text}",
-            thread_ts=thread_ts_from_event
+            thread_ts=translation_thread_ts
         )
 
-        # 2. URL과 텍스트를 분리합니다.
+        # 3. URL과 텍스트를 분리합니다.
         url_pattern = r"http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\(\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+"
-        urls = re.findall(url_pattern, text)
-        text_to_translate = re.sub(url_pattern, "", text).strip()
+        urls = []
+        def replace_url(match):
+            urls.append(match.group(0))
+            return f"__URL_PLACEHOLDER_{len(urls)-1}__"
+        
+        text_with_placeholders = re.sub(url_pattern, replace_url, text)
 
-        # 3. 번역을 수행합니다.
-        if text_to_translate:
-            prompt = f"You are a translator. Detect the language of the following text. If it is Korean, translate it to English. For all other languages, translate it to Korean. Please format the translation using Slack's markdown syntax for optimal display (e.g., use *bold* instead of **bold**). Do not add any other text to the response, only the translated text itself. Text to translate: {text_to_translate}"
+        # 4. 번역을 수행합니다.
+        if re.sub(r'__URL_PLACEHOLDER_\d+__', '', text_with_placeholders).strip():
+            prompt = f"""You are a professional translator. Your task is to translate the given text.
+                - Detect the language of the text.
+                - If it is Korean, translate it to English.
+                - For all other languages, translate it to Korean.
+                - IMPORTANT: The text may contain placeholders like `__URL_PLACEHOLDER_0__`. You MUST preserve these placeholders in your translated output exactly as they are, including the underscores and numbers. Do not translate the placeholders.
+                - Preserve all original line breaks and spacing.
+                - Provide only the raw, translated text. Do not add any markdown formatting or any other explanatory text to the response.
+
+                Text to translate:
+                {text_with_placeholders}
+                """
             
             translation_response = model.generate_content(prompt)
-            translated_text = translation_response.text.strip()
-        else:
-            translated_text = ""
+            translated_text_with_placeholders = translation_response.text.strip()
 
-        # 4. 번역된 텍스트와 원본 URL을 조합합니다.
-        final_translated_text = f"{translated_text} {' '.join(urls)}".strip()
+            final_translated_text = translated_text_with_placeholders
+            for i, url in enumerate(urls):
+                final_translated_text = final_translated_text.replace(f"__URL_PLACEHOLDER_{i}__", url)
+        else:
+            final_translated_text = ' '.join(urls)
 
         is_korean = any(c >= '가' and c <= '힣' for c in text)
         if is_korean:
-            reply_text = f"🌐 *Translation (EN) from <@{user_id}>:*{final_translated_text}"
+            reply_text = f"🌐 Translation (EN) from <@{user_id}>: {final_translated_text}"
         else:
-            reply_text = f"🌐 *번역 (KR) from <@{user_id}>:*{final_translated_text}"
+            reply_text = f"🌐 번역 (KR) from <@{user_id}>: {final_translated_text}"
 
         # 5. "생각 중" 메시지를 최종 번역 결과로 업데이트합니다.
         app.client.chat_update(
@@ -280,8 +301,11 @@ def translate_message(event, say, logger):
         # 6. Notion 링크를 확인하고 제안/오류 메시지를 보낼 위치를 결정합니다.
         page_id = get_page_id_from_url(text)
         if page_id:
-            # 원본이 스레드 댓글이면 해당 스레드에, 아니면 번역 메시지(업데이트된 메시지)에 스레드를 만듭니다.
-            thread_for_notion = thread_ts_from_event if thread_ts_from_event else thinking_response['ts']
+            thread_for_notion = None
+            if translation_thread_ts: # 채널인 경우
+                thread_for_notion = translation_thread_ts
+            else: # DM/MPIM인 경우
+                thread_for_notion = thinking_response['ts'] # 번역 메시지 아래에 스레드 생성
             
             logger.info(f"Found a Notion Page ID in the translated message: {page_id}")
             try:
@@ -299,7 +323,8 @@ def translate_message(event, say, logger):
                 if title_property and title_prop_name:
                     original_title = title_property.get('title', [{}])[0].get('plain_text', 'Untitled')
                     
-                    if any('가' <= char <= '힣' for char in original_title):
+                    is_already_formatted = re.search(r"\s*\([^)]+\)", original_title)
+                    if any('가' <= char <= '힣' for char in original_title) and not is_already_formatted:
                         prompt = f"Translate the following Korean document title to English. Respond with only the translated title, without any additional text or quotation marks. Title: '{original_title}'"
                         title_translation_response = model.generate_content(prompt)
                         english_title = title_translation_response.text.strip()
@@ -308,7 +333,6 @@ def translate_message(event, say, logger):
                         ask_to_translate_title(say, channel_id, thread_for_notion, page_id, original_title, new_title_format, title_prop_name)
                 else:
                     logger.warning(f"Could not find a title property for page ID: {page_id}")
-
             except notion_client.errors.APIResponseError as e:
                 if e.code == "object_not_found":
                     error_message_kr = (
@@ -326,7 +350,6 @@ def translate_message(event, say, logger):
             except Exception as e:
                 logger.error(f"An unexpected error occurred while handling Notion link: {e}")
                 say(channel=channel_id, thread_ts=thread_for_notion, text=f":warning: An unexpected error occurred while processing the Notion link: ```{e}```")
-
     except Exception as e:
         logger.error(f"Error during translation process: {e}")
         if thinking_response and thinking_response.get('ts'):
@@ -337,6 +360,7 @@ def translate_message(event, say, logger):
             )
         else:
             say(text=f"Sorry, an error occurred during translation: {e}")
+
 
 
 
