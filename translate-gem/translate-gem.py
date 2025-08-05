@@ -68,34 +68,35 @@ class ChannelManager:
 channel_manager = ChannelManager()
 
 @app.command("/translate-gem-channel")
-def handle_translate_command(ack, command, say, logger):
-    ack()
-    try:
-        subcommand = command.get('text', '').strip().lower()
-        channel_id = command['channel_id']
+def handle_translate_command(ack, command, logger):
+    subcommand = command.get('text', '').strip().lower()
+    channel_id = command['channel_id']
+    response_text = "Invalid command. Please use `/translate-gem-channel add`, `/translate-gem-channel remove`, or `/translate-gem-channel list`."
 
+    try:
         if subcommand == 'add':
             if channel_manager.add_channel(channel_id):
-                say(text="This channel is now enabled for real-time translation.", channel=channel_id)
+                response_text = "✅ This channel is now enabled for real-time translation. Please make sure I am invited to this channel."
             else:
-                say(text="This channel is already enabled for translation.", channel=channel_id)
+                response_text = "This channel is already enabled for translation."
         elif subcommand == 'remove':
             if channel_manager.remove_channel(channel_id):
-                say(text="Real-time translation has been disabled for this channel.", channel=channel_id)
+                response_text = "Real-time translation has been disabled for this channel."
             else:
-                say(text="This channel was not enabled for translation.", channel=channel_id)
+                response_text = "This channel was not enabled for translation."
         elif subcommand == 'list':
             registered_channels = channel_manager.get_channels()
             if registered_channels:
-                channel_links = [f"<#{c}>"]
-                say(f"Real-time translation is currently active in the following channels: {', '.join(channel_links)}")
+                channel_links = [f"<#{c}>" for c in registered_channels]
+                response_text = f"Real-time translation is currently active in the following channels: {', '.join(channel_links)}"
             else:
-                say("Real-time translation is not active in any channels.")
-        else:
-            say("Invalid command. Please use `/translate-gem-channel add`, `/translate-gem-channel remove`, or `/translate-gem-channel list`.")
+                response_text = "Real-time translation is not active in any channels."
+        
+        ack(text=response_text)
+
     except Exception as e:
         logger.error(f"Error handling /translate-gem-channel command: {e}")
-        say(f"An error occurred while processing your command: {e}")
+        ack(text=f"An error occurred while processing your command: {e}")
 
 @app.event("member_joined_channel")
 def handle_member_joined_channel(event, say, logger):
@@ -128,12 +129,8 @@ def get_page_id_from_url(url):
         return match.group(0)
     return None
 
-def ask_to_translate_document(say, channel, ts, page_id, title):
-    """Asks the user if they want to translate the Notion document."""
-    is_korean = any(c >= '가' and c <= '힣' for c in title)
-    suffix = "_EN" if is_korean else "_KR"
-    new_title = f"{title}{suffix}"
-
+def ask_to_translate_title(say, channel, ts, page_id, original_title, new_title, title_prop_name):
+    """Asks the user if they want to translate the Notion document title."""
     say(
         channel=channel,
         thread_ts=ts,
@@ -142,7 +139,7 @@ def ask_to_translate_document(say, channel, ts, page_id, title):
                 "type": "section",
                 "text": {
                     "type": "mrkdwn",
-                    "text": f"Do you want to translate this document and create a new one titled *{new_title}*?"
+                    "text": f"In accordance with company policy, Notion document titles should be in English. Would you like to translate the title as follows?\n\n*Current Title:* {original_title}\n*Suggested Title:* {new_title}"
                 }
             },
             {
@@ -150,63 +147,95 @@ def ask_to_translate_document(say, channel, ts, page_id, title):
                 "elements": [
                     {
                         "type": "button",
-                        "text": {"type": "plain_text", "text": "✅ Yes, create it"},
+                        "text": {"type": "plain_text", "text": "✅ Yes, change it"},
                         "style": "primary",
-                        "action_id": "translate_notion_confirm",
-                        "value": json.dumps({"page_id": page_id, "new_title": new_title})
+                        "action_id": "translate_title_confirm",
+                        "value": json.dumps({"page_id": page_id, "new_title": new_title, "title_prop_name": title_prop_name})
                     },
                     {
                         "type": "button",
                         "text": {"type": "plain_text", "text": "No"},
                         "style": "danger",
-                        "action_id": "translate_notion_cancel"
+                        "action_id": "translate_title_cancel"
                     }
                 ]
             }
         ]
     )
 
-@app.action("translate_notion_cancel")
-def handle_translate_notion_cancel(ack, body):
+@app.action("translate_title_cancel")
+def handle_translate_title_cancel(ack, body):
     ack()
     app.client.chat_delete(channel=body['channel']['id'], ts=body['message']['ts'])
 
-@app.action("translate_notion_confirm")
-def handle_translate_notion_confirm(ack, body, say):
+@app.action("translate_title_confirm")
+def handle_translate_title_confirm(ack, body, say, logger):
     ack()
     action_details = json.loads(body['actions'][0]['value'])
     page_id = action_details['page_id']
     new_title = action_details['new_title']
+    title_prop_name = action_details['title_prop_name']
     
-    app.client.chat_update(
-        channel=body['channel']['id'],
-        ts=body['message']['ts'],
-        blocks=[
-            {
-                "type": "section",
-                "text": {
-                    "type": "mrkdwn",
-                    "text": f":hourglass_flowing_sand: Notion 문서(*{new_title}*) 번역을 시작합니다. 잠시만 기다려주세요..."
+    original_ts = body['message']['ts']
+    channel_id = body['channel']['id']
+
+    try:
+        app.client.chat_update(
+            channel=channel_id,
+            ts=original_ts,
+            blocks=[
+                {
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": f":hourglass_flowing_sand: Changing Notion document title to '{new_title}'..."
+                    }
+                }
+            ],
+            text=f"Changing Notion document title..."
+        )
+
+        notion.pages.update(
+            page_id=page_id,
+            properties={
+                title_prop_name: {
+                    "title": [{"text": {"content": new_title}}]
                 }
             }
-        ]
-    )
-    # TODO: Implement the actual document translation logic here
+        )
+
+        app.client.chat_update(
+            channel=channel_id,
+            ts=original_ts,
+            blocks=[],
+            text=f"✅ Notion document title successfully changed to: *{new_title}*"
+        )
+
+    except Exception as e:
+        logger.error(f"Error updating Notion page title: {e}")
+        app.client.chat_update(
+            channel=channel_id,
+            ts=original_ts,
+            blocks=[],
+            text=f":warning: An error occurred while updating the Notion page title: ```{e}```"
+        )
+
 
 def translate_message(event, say, logger):
-    """Translate a message and post it. If it contains a Notion link, ask to translate the document in a thread."""
+    """
+    메시지를 번역하고 올바른 위치(채널 또는 스레드)에 게시합니다.
+    Notion 링크가 포함된 경우, 번역 메시지 아래 스레드에 제안을 보냅니다.
+    """
     channel_id = event.get('channel')
-    channel_type = event.get('channel_type')
     user_id = event.get('user')
     text = event.get('text')
-    ts = event.get('ts')
     
-    in_thread = channel_type not in ['im', 'mpim']
-    thread_ts = ts if in_thread else None
-
+    # 원본 메시지가 스레드에 있는지 확인합니다.
+    thread_ts_from_event = event.get('thread_ts')
+    
     thinking_response = None
     try:
-        # 1. Post a public "thinking" message
+        # 1. 모든 사용자에게 보이는 "생각 중" 메시지를 보냅니다.
         thinking_messages = [
             "Interpreting Heptapod Language…", "Translating to Mentalese…",
             "Analyzing linguistic patterns…", "Connecting to the universal translator…"
@@ -215,15 +244,15 @@ def translate_message(event, say, logger):
         
         thinking_response = say(
             text=f":thought_balloon: {thinking_message_text}",
-            thread_ts=thread_ts
+            thread_ts=thread_ts_from_event
         )
 
-        # 2. Separate URL from the text
+        # 2. URL과 텍스트를 분리합니다.
         url_pattern = r"http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\(\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+"
         urls = re.findall(url_pattern, text)
         text_to_translate = re.sub(url_pattern, "", text).strip()
 
-        # 3. Perform the translation only if there is text to translate
+        # 3. 번역을 수행합니다.
         if text_to_translate:
             prompt = f"You are a translator. Detect the language of the following text. If it is Korean, translate it to English. For all other languages, translate it to Korean. Please format the translation using Slack's markdown syntax for optimal display (e.g., use *bold* instead of **bold**). Do not add any other text to the response, only the translated text itself. Text to translate: {text_to_translate}"
             
@@ -232,47 +261,71 @@ def translate_message(event, say, logger):
         else:
             translated_text = ""
 
-        # 4. Combine translated text with the original URLs
+        # 4. 번역된 텍스트와 원본 URL을 조합합니다.
         final_translated_text = f"{translated_text} {' '.join(urls)}".strip()
 
         is_korean = any(c >= '가' and c <= '힣' for c in text)
         if is_korean:
-            reply_text = f"🌐 *Translation (EN):*\n<@{user_id}> {final_translated_text}"
+            reply_text = f"🌐 *Translation (EN) from <@{user_id}>:*{final_translated_text}"
         else:
-            reply_text = f"🌐 *번역 (KR):*\n<@{user_id}> {final_translated_text}"
+            reply_text = f"🌐 *번역 (KR) from <@{user_id}>:*{final_translated_text}"
 
-        # 5. Update the thinking message with the final result
+        # 5. "생각 중" 메시지를 최종 번역 결과로 업데이트합니다.
         app.client.chat_update(
             channel=channel_id,
             ts=thinking_response['ts'],
             text=reply_text
         )
         
-        # 6. NEW: Check for Notion link and ask to translate the document
+        # 6. Notion 링크를 확인하고 제안/오류 메시지를 보낼 위치를 결정합니다.
         page_id = get_page_id_from_url(text)
         if page_id:
+            # 원본이 스레드 댓글이면 해당 스레드에, 아니면 번역 메시지(업데이트된 메시지)에 스레드를 만듭니다.
+            thread_for_notion = thread_ts_from_event if thread_ts_from_event else thinking_response['ts']
+            
             logger.info(f"Found a Notion Page ID in the translated message: {page_id}")
             try:
                 page = notion.pages.retrieve(page_id=page_id)
                 
-                # Find the title property by its type
                 properties = page.get('properties', {})
                 title_property = None
-                for prop in properties.values():
-                    if prop.get('type') == 'title':
-                        title_property = prop
+                title_prop_name = None
+                for prop_name, prop_details in properties.items():
+                    if prop_details.get('type') == 'title':
+                        title_property = prop_details
+                        title_prop_name = prop_name
                         break
                 
-                if title_property:
+                if title_property and title_prop_name:
                     original_title = title_property.get('title', [{}])[0].get('plain_text', 'Untitled')
+                    
+                    if any('가' <= char <= '힣' for char in original_title):
+                        prompt = f"Translate the following Korean document title to English. Respond with only the translated title, without any additional text or quotation marks. Title: '{original_title}'"
+                        title_translation_response = model.generate_content(prompt)
+                        english_title = title_translation_response.text.strip()
+                        new_title_format = f"{original_title} ({english_title})"
+                        
+                        ask_to_translate_title(say, channel_id, thread_for_notion, page_id, original_title, new_title_format, title_prop_name)
                 else:
-                    original_title = 'Untitled'
-                
-                # Ask to translate the document in the original message's thread
-                ask_to_translate_document(say, channel_id, thinking_response['ts'], page_id, original_title)
+                    logger.warning(f"Could not find a title property for page ID: {page_id}")
+
+            except notion_client.errors.APIResponseError as e:
+                if e.code == "object_not_found":
+                    error_message_kr = (
+                        ":warning: Notion 페이지에 접근할 수 없습니다. "
+                        "페이지가 존재하지 않거나, 저에게 접근 권한이 없는 것 같아요."
+                    )
+                    error_message_en = (
+                        ":warning: I can't access that Notion page. "
+                        "It might not exist, or I may not have permission."
+                    )
+                    say(channel=channel_id, thread_ts=thread_for_notion, text=f"{error_message_kr}\n\n{error_message_en}")
+                else:
+                    logger.error(f"Notion API Error: {e}")
+                    say(channel=channel_id, thread_ts=thread_for_notion, text=f":warning: An error occurred with the Notion API: ```{e}```")
             except Exception as e:
-                logger.error(f"Error handling Notion link after translation: {e}")
-                say(channel=channel_id, thread_ts=ts, text=f":warning: Notion 링크 처리 중 오류가 발생했습니다:```{e}```")
+                logger.error(f"An unexpected error occurred while handling Notion link: {e}")
+                say(channel=channel_id, thread_ts=thread_for_notion, text=f":warning: An unexpected error occurred while processing the Notion link: ```{e}```")
 
     except Exception as e:
         logger.error(f"Error during translation process: {e}")
@@ -282,13 +335,15 @@ def translate_message(event, say, logger):
                 ts=thinking_response['ts'],
                 text=f"Sorry, an error occurred during translation: {e}"
             )
+        else:
+            say(text=f"Sorry, an error occurred during translation: {e}")
+
+
 
 
 @app.event("message")
 def handle_message_events(body, say, logger):
     event = body.get('event', {})
-
-    logger.info(f"\n\nhandle_message_events: \n {event}\n")
     # --- Robust Bot Message Check ---
     if event.get("bot_id"):
         return
