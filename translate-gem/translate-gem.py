@@ -315,11 +315,11 @@ def translate_message(event, say, client, logger):
         
         text_with_placeholders = re.sub(url_pattern, replace_url, text)
 
-        # 인용된 내용과 원본 텍스트를 결합
+        # 인용된 내용과 원본 텍스트를 결합 (원본이 위로)
         full_text_to_translate = text_with_placeholders
         if linked_content_for_translation:
             quoted_section = "\n".join(linked_content_for_translation)
-            full_text_to_translate = f"--- Quoted Message ---\n{quoted_section}\n--------------------------\n\n{text_with_placeholders}"
+            full_text_to_translate = f"{text_with_placeholders}\n\n\nFrom Slack Link:\n{quoted_section}\n"
 
         # 4. 번역을 수행합니다.
         if re.sub(r'__URL_PLACEHOLDER_\d+__', '', full_text_to_translate).strip():
