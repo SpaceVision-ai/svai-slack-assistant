@@ -57,13 +57,11 @@ def format_conversation_history(client, channel_id, messages):
         
         user_id = msg["user"]
         user_name = get_user_info(user_id)
-        text = msg["text"]
+        text = msg["text"].strip() # Just strip, don't remove mentions
         
-        # Clean up mentions from the text
-        text = re.sub(r'<@U[A-Z0-9]+>', '', text).strip()
-        
-        if text: # Only add messages that have content after cleaning
-            formatted_messages.append(f"{user_name}: {text}")
+        if text: # Only add messages that have content
+            # Provide the model with both the user's real name and their mentionable ID
+            formatted_messages.append(f"{user_name} (<@{user_id}>): {text}")
 
         # If the message has replies, fetch the thread
         if msg.get("reply_count", 0) > 0:
@@ -73,10 +71,11 @@ def format_conversation_history(client, channel_id, messages):
                 # Skip the parent message (already added) and format replies
                 for reply in replies_response.get("messages", [])[1:]:
                     if "user" in reply and "text" in reply:
-                        reply_user_name = get_user_info(reply["user"])
-                        reply_text = re.sub(r'<@U[A-Z0-9]+>', '', reply["text"]).strip()
+                        reply_user_id = reply["user"]
+                        reply_user_name = get_user_info(reply_user_id)
+                        reply_text = reply["text"].strip()
                         if reply_text:
-                            formatted_messages.append(f"  (in thread) {reply_user_name}: {reply_text}")
+                            formatted_messages.append(f"  (in thread) {reply_user_name} (<@{reply_user_id}>): {reply_text}")
             except Exception as e:
                 logger.error(f"Error fetching replies for thread {thread_ts}: {e}")
 
@@ -169,11 +168,15 @@ def handle_app_mention_events(body, say, client, logger):
                 conversation_history = format_conversation_history(client, channel_id, messages)
                 
                 prompt = (
-                    f"You are a helpful AI assistant. Continue the following Slack conversation, paying close attention to the context. "
+                    f"You are a helpful AI assistant in a Slack conversation. "
+                    f"Your name is Space Gemini. "
+                    f"When you mention a user, you MUST use their Slack user ID in the format <@USER_ID>. "
+                    f"For example, if you are talking to John Doe (<@U12345>), you must mention them as `<@U12345>`."
+                    f"Continue the following Slack conversation, paying close attention to the context. "
                     f"The user is asking a follow-up question in a thread.\n\n"
                     f"--- Conversation History ---\n{conversation_history}\n\n"
-                    f"--- New Question ---\n{user_text}\n\n"
-                    f"Please provide a direct answer to the new question based on the history."
+                    f"--- New Question from {get_user_info(event['user'])} (<@{event['user']}>) ---{user_text}\n\n"
+                    f"Please provide a direct and helpful answer to the new question based on the history."
                 )
 
                 gemini_payload = [prompt]
@@ -239,10 +242,13 @@ def handle_app_mention_events(body, say, client, logger):
                         client.chat_update(channel=channel_id, ts=thinking_message["ts"], text="요약할 댓글을 찾지 못했어요. 😢")
                         return
                     summary_prompt = (
-                        f"다음 Slack 스레드 대화 내용을 요약해 주세요. "
-                        f"다른 부가적인 설명 없이 요약된 내용만 제공해야 합니다.\n\n"
-                        f"--- 사용자의 요청사항 ---\n{event.get('text')}\n\n"
-                        f"--- 스레드 댓글 내용 ---\n{formatted_history}"
+                        f"You are a helpful AI assistant in a Slack conversation. "
+                        f"Your name is Space Gemini. "
+                        f"When you mention a user, you MUST use their Slack user ID in the format <@USER_ID>. "
+                        f"Summarize the following Slack thread conversation. "
+                        f"Provide only the summary, without any additional explanations.\n\n"
+                        f"--- User's Request ---\n{event.get('text')}\n\n"
+                        f"--- Thread Content ---\n{formatted_history}"
                     )
                     response = model.generate_content(summary_prompt)
                     handle_gemini_response(client, channel_id, thinking_message, response.text, thread_ts=summary_thread_ts)
@@ -261,10 +267,13 @@ def handle_app_mention_events(body, say, client, logger):
                         client.chat_update(channel=channel_id, ts=thinking_message["ts"], text="요약할 대화 내용을 찾지 못했어요. 😢")
                         return
                     summary_prompt = (
-                        f"다음 Slack 채널의 대화 내용을 요약해 주세요. "
-                        f"다른 부가적인 설명 없이 요약된 내용만 제공해야 합니다.\n\n"
-                        f"--- 사용자의 요청사항 ---\n{event.get('text')}\n\n"
-                        f"--- 채널 대화 내용 ---\n{formatted_history}"
+                        f"You are a helpful AI assistant in a Slack conversation. "
+                        f"Your name is Space Gemini. "
+                        f"When you mention a user, you MUST use their Slack user ID in the format <@USER_ID>. "
+                        f"Summarize the following Slack channel conversation. "
+                        f"Provide only the summary, without any additional explanations.\n\n"
+                        f"--- User's Request ---\n{event.get('text')}\n\n"
+                        f"--- Channel Conversation Content ---\n{formatted_history}"
                     )
                     response = model.generate_content(summary_prompt)
                     handle_gemini_response(client, channel_id, thinking_message, response.text, thread_ts=message_ts)
