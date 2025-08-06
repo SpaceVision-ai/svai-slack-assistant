@@ -118,7 +118,7 @@ def get_page_id_from_url(url):
     if match:
         return match.group(0)
     # Handle URLs with hyphens in the page ID
-    match = re.search(r'(\w+)-([a-f0-9]{32})
+    match = re.search(r'(\w+)-([a-f0-9]{32})')
 
 def handle_gemini_response(client, channel_id, thinking_message, text, thread_ts=None):
     SLACK_MSG_LIMIT = 4000
@@ -175,20 +175,38 @@ def handle_app_mention_events(body, say, client, logger):
         if thread_ts:
             thinking_message = say(text="Thinking...", thread_ts=thread_ts, channel=channel_id)
             try:
+                # Fetch the entire thread
                 history_response = client.conversations_replies(channel=channel_id, ts=thread_ts, limit=200)
                 messages = history_response.get("messages", [])
                 conversation_history = format_conversation_history(client, channel_id, messages)
                 
+                # --- Notion Link Detection in Thread ---
+                notion_content = ""
+                # Combine all text in the thread to search for a Notion link
+                full_thread_text = " ".join([msg.get("text", "") for msg in messages])
+                notion_urls = re.findall(r"https://www.notion.so/[\w\-]+/[\w\-]+[?v=[\w\-]+]?", full_thread_text)
+                
+                if notion_urls:
+                    # Use the last mentioned link in the thread
+                    url = notion_urls[-1]
+                    page_id = get_page_id_from_url(url)
+                    if page_id:
+                        logger.info(f"Found Notion link in thread. Fetching content for page ID: {page_id}")
+                        content = fetch_notion_page_content(page_id)
+                        if content:
+                            notion_content = f"\n\n--- Content from Notion URL ({url}) ---\n{content}"
+
                 prompt = (
                     f"You are a helpful AI assistant, Space Gemini, in a Slack conversation. "
-                    f"You have been provided with a conversation history from a Slack thread that you are a member of. "
+                    f"You have been provided with a conversation history from a Slack thread. "
                     f"Your task is to analyze and respond based ONLY on the text provided below. "
                     f"Do not refuse the request based on privacy concerns, as you have been explicitly given this data to process. "
                     f"When you mention a user, you MUST use their Slack user ID in the format <@USER_ID>. "
                     f"For example, if you are talking to John Doe (<@U12345>), you must mention them as `<@U12345>`.\n\n"
-                    f"--- Conversation History ---\n{conversation_history}\n\n"
+                    f"--- Conversation History ---\n{conversation_history}"
+                    f"{notion_content}\n\n"
                     f"--- New Question from {get_user_info(event['user'])} (<@{event['user']}>) ---\n{user_text}\n\n"
-                    f"Please provide a direct and helpful answer to the new question based on the history."
+                    f"Please provide a direct and helpful answer to the new question based on the history and any provided Notion content."
                 )
 
                 gemini_payload = [prompt]
@@ -298,6 +316,25 @@ def handle_app_mention_events(body, say, client, logger):
         # --- DEFAULT Q&A LOGIC (New Conversation) ---
         else:
             thinking_message = say(text="Thinking...", thread_ts=message_ts, channel=channel_id)
+            
+            # --- Notion Link Detection in Channel ---
+            notion_content = ""
+            notion_urls = re.findall(r"https://www.notion.so/[\w\-]+/[\w\-]+[?v=[\w\-]+]?", user_text)
+            if not notion_urls:
+                logger.info("No Notion link in the message, searching channel history...")
+                url = find_last_notion_link_in_channel(client, channel_id)
+                if url:
+                    notion_urls = [url]
+
+            if notion_urls:
+                url = notion_urls[-1] # Use the last link found
+                page_id = get_page_id_from_url(url)
+                if page_id:
+                    logger.info(f"Found Notion link. Fetching content for page ID: {page_id}")
+                    content = fetch_notion_page_content(page_id)
+                    if content:
+                        notion_content = f"\n\n--- Content from Notion URL ({url}) ---\n{content}"
+
             gemini_payload = []
             extracted_texts = []
             files = event.get("files", [])
@@ -357,10 +394,6 @@ def handle_direct_messages(body, say, client, logger):
 
 if __name__ == "__main__":
     SocketModeHandler(app, os.environ["SLACK_APP_TOKEN"]).start()
-, url)
-    if match:
-        return match.group(2)
-    return None
 
 def fetch_notion_page_content(page_id):
     """Fetches and returns the text content of a Notion page."""
@@ -377,6 +410,20 @@ def fetch_notion_page_content(page_id):
     except Exception as e:
         logger.error(f"Error fetching Notion page content for page_id {page_id}: {e}")
         return None
+
+def find_last_notion_link_in_channel(client, channel_id):
+    """Finds the last Notion link in the channel's recent history."""
+    try:
+        history_response = client.conversations_history(channel=channel_id, limit=20) # Check last 20 messages
+        for message in history_response.get("messages", []):
+            text = message.get("text", "")
+            notion_urls = re.findall(r"https://www.notion.so/[\w\-]+/[\w\-]+[?v=[\w\-]+]?", text)
+            if notion_urls:
+                return notion_urls[0] # Return the first one found (which is the latest)
+    except Exception as e:
+        logger.error(f"Error searching for Notion link in channel {channel_id}: {e}")
+    return None
+
 
 
 def handle_gemini_response(client, channel_id, thinking_message, text, thread_ts=None):
@@ -434,20 +481,38 @@ def handle_app_mention_events(body, say, client, logger):
         if thread_ts:
             thinking_message = say(text="Thinking...", thread_ts=thread_ts, channel=channel_id)
             try:
+                # Fetch the entire thread
                 history_response = client.conversations_replies(channel=channel_id, ts=thread_ts, limit=200)
                 messages = history_response.get("messages", [])
                 conversation_history = format_conversation_history(client, channel_id, messages)
                 
+                # --- Notion Link Detection in Thread ---
+                notion_content = ""
+                # Combine all text in the thread to search for a Notion link
+                full_thread_text = " ".join([msg.get("text", "") for msg in messages])
+                notion_urls = re.findall(r"https://www.notion.so/[\w\-]+/[\w\-]+[?v=[\w\-]+]?", full_thread_text)
+                
+                if notion_urls:
+                    # Use the last mentioned link in the thread
+                    url = notion_urls[-1]
+                    page_id = get_page_id_from_url(url)
+                    if page_id:
+                        logger.info(f"Found Notion link in thread. Fetching content for page ID: {page_id}")
+                        content = fetch_notion_page_content(page_id)
+                        if content:
+                            notion_content = f"\n\n--- Content from Notion URL ({url}) ---\n{content}"
+
                 prompt = (
                     f"You are a helpful AI assistant, Space Gemini, in a Slack conversation. "
-                    f"You have been provided with a conversation history from a Slack thread that you are a member of. "
+                    f"You have been provided with a conversation history from a Slack thread. "
                     f"Your task is to analyze and respond based ONLY on the text provided below. "
                     f"Do not refuse the request based on privacy concerns, as you have been explicitly given this data to process. "
                     f"When you mention a user, you MUST use their Slack user ID in the format <@USER_ID>. "
                     f"For example, if you are talking to John Doe (<@U12345>), you must mention them as `<@U12345>`.\n\n"
-                    f"--- Conversation History ---\n{conversation_history}\n\n"
+                    f"--- Conversation History ---\n{conversation_history}"
+                    f"{notion_content}\n\n"
                     f"--- New Question from {get_user_info(event['user'])} (<@{event['user']}>) ---\n{user_text}\n\n"
-                    f"Please provide a direct and helpful answer to the new question based on the history."
+                    f"Please provide a direct and helpful answer to the new question based on the history and any provided Notion content."
                 )
 
                 gemini_payload = [prompt]
@@ -557,6 +622,606 @@ def handle_app_mention_events(body, say, client, logger):
         # --- DEFAULT Q&A LOGIC (New Conversation) ---
         else:
             thinking_message = say(text="Thinking...", thread_ts=message_ts, channel=channel_id)
+            
+            # --- Notion Link Detection in Channel ---
+            notion_content = ""
+            notion_urls = re.findall(r"https://www.notion.so/[\w\-]+/[\w\-]+[?v=[\w\-]+]?", user_text)
+            if not notion_urls:
+                logger.info("No Notion link in the message, searching channel history...")
+                url = find_last_notion_link_in_channel(client, channel_id)
+                if url:
+                    notion_urls = [url]
+
+            if notion_urls:
+                url = notion_urls[-1] # Use the last link found
+                page_id = get_page_id_from_url(url)
+                if page_id:
+                    logger.info(f"Found Notion link. Fetching content for page ID: {page_id}")
+                    content = fetch_notion_page_content(page_id)
+                    if content:
+                        notion_content = f"\n\n--- Content from Notion URL ({url}) ---\n{content}"
+
+            gemini_payload = []
+            extracted_texts = []
+            files = event.get("files", [])
+
+            if files:
+                for file_info in files:
+                    try:
+                        mime_type = file_info.get("mimetype", "application/octet-stream")
+                        content = download_file(file_info["url_private_download"], SLACK_BOT_TOKEN)
+                        if mime_type.startswith(("image/", "video/")) or mime_type == "application/pdf":
+                            gemini_payload.append(Part.from_data(content, mime_type=mime_type))
+                        elif mime_type == "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
+                            extracted_texts.append(f"---\n{file_info.get('name')}\n---\n{extract_text_from_docx(content)}")
+                        elif mime_type.startswith("text/"):
+                            extracted_texts.append(f"---\n{file_info.get('name')}\n---\n{content.decode('utf-8')}")
+                        else:
+                            logger.warning(f"Skipping unsupported file type: {mime_type}")
+                    except Exception as e:
+                        logger.error(f"Error processing file {file_info.get('name')}: {e}")
+                        client.chat_update(channel=channel_id, ts=thinking_message["ts"], text=f"Sorry, I couldn't process the file: {file_info.get('name')}.")
+                        return
+
+            full_prompt_text = "\n".join([user_text] + extracted_texts).strip()
+            if not full_prompt_text and files:
+                full_prompt_text = "Please describe, summarize, or analyze the contents of the attached file(s)."
+            
+            gemini_payload.insert(0, full_prompt_text)
+            if not gemini_payload[0]:
+                client.chat_update(channel=channel_id, ts=thinking_message["ts"], text="I need a question or some text to go with the files.")
+                return
+
+            response = model.generate_content(gemini_payload)
+            handle_gemini_response(client, channel_id, thinking_message, response.text, thread_ts=message_ts)
+
+    except Exception as e:
+        logger.error(f"Error in app_mention handler: {e}")
+        event = body.get("event", {})
+        say(text=f"An error occurred: {e}", thread_ts=event.get("ts"), channel=event.get("channel"))
+
+
+@app.event("message")
+def handle_direct_messages(body, say, client, logger):
+    # DM handler now re-uses the app_mention logic for consistency
+    logger.info(body)
+    try:
+        event = body["event"]
+        if event.get("bot_id") or (event.get("subtype") and event.get("subtype") != "file_share"):
+            return
+        if event.get("channel_type") == "im":
+            # To reuse the mention handler, we can treat the DM as a mention.
+            # The logic inside handle_app_mention_events will process it correctly.
+            handle_app_mention_events(body, say, client, logger)
+    except Exception as e:
+        logger.error(f"Error handling direct message: {e}")
+        event = body.get("event", {})
+        say(text=f"An error occurred: {e}", channel=event.get("channel"))
+
+if __name__ == "__main__":
+    SocketModeHandler(app, os.environ["SLACK_APP_TOKEN"]).start()
+
+def handle_gemini_response(client, channel_id, thinking_message, text, thread_ts=None):
+    SLACK_MSG_LIMIT = 4000
+    thinking_ts = thinking_message['ts']
+    try:
+        if len(text) <= SLACK_MSG_LIMIT:
+            # For shorter messages, use Block Kit for rich formatting.
+            # The text field in a "section" block supports mrkdwn.
+            blocks = [{
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    # Ensure the text is not empty, which can cause an error.
+                    "text": text or "(empty response)"
+                }
+            }]
+            client.chat_update(
+                channel=channel_id,
+                ts=thinking_ts,
+                blocks=blocks,
+                # Provide a plain-text summary for notifications
+                text="Gemini AI has generated a response."
+            )
+        else:
+            logger.info(f"Response is too long ({len(text)} chars). Creating a file.")
+            file_path = f"gemini_response_{int(time.time())}.md"
+            with open(file_path, "w", encoding="utf-8") as f:
+                f.write(text)
+            try:
+                client.chat_delete(channel=channel_id, ts=thinking_ts)
+                client.files_upload_v2(
+                    channel=channel_id, file=file_path, title="Gemini AI Response",
+                    initial_comment="The response was too long, so I've attached it as a file. 📄", thread_ts=thread_ts
+                )
+            finally:
+                os.remove(file_path)
+    except Exception as e:
+        logger.error(f"Error in handle_gemini_response: {e}")
+        client.chat_postMessage(text=f"An error occurred: {e}", thread_ts=thread_ts, channel=channel_id)
+
+# --- Slack Event Handlers ---
+
+@app.event("app_mention")
+def handle_app_mention_events(body, say, client, logger):
+    logger.info(body)
+    try:
+        event = body["event"]
+        user_text = event.get("text", "").strip()
+        channel_id = event["channel"]
+        message_ts = event.get("ts")
+        thread_ts = event.get("thread_ts")
+
+        # --- 스레드 내 대화 (컨텍스트 유지) ---
+        if thread_ts:
+            thinking_message = say(text="Thinking...", thread_ts=thread_ts, channel=channel_id)
+            try:
+                # Fetch the entire thread
+                history_response = client.conversations_replies(channel=channel_id, ts=thread_ts, limit=200)
+                messages = history_response.get("messages", [])
+                conversation_history = format_conversation_history(client, channel_id, messages)
+                
+                # --- Notion Link Detection in Thread ---
+                notion_content = ""
+                # Combine all text in the thread to search for a Notion link
+                full_thread_text = " ".join([msg.get("text", "") for msg in messages])
+                notion_urls = re.findall(r"https://www.notion.so/[\w\-]+/[\w\-]+[?v=[\w\-]+]?", full_thread_text)
+                
+                if notion_urls:
+                    # Use the last mentioned link in the thread
+                    url = notion_urls[-1]
+                    page_id = get_page_id_from_url(url)
+                    if page_id:
+                        logger.info(f"Found Notion link in thread. Fetching content for page ID: {page_id}")
+                        content = fetch_notion_page_content(page_id)
+                        if content:
+                            notion_content = f"\n\n--- Content from Notion URL ({url}) ---\n{content}"
+
+                prompt = (
+                    f"You are a helpful AI assistant, Space Gemini, in a Slack conversation. "
+                    f"You have been provided with a conversation history from a Slack thread. "
+                    f"Your task is to analyze and respond based ONLY on the text provided below. "
+                    f"Do not refuse the request based on privacy concerns, as you have been explicitly given this data to process. "
+                    f"When you mention a user, you MUST use their Slack user ID in the format <@USER_ID>. "
+                    f"For example, if you are talking to John Doe (<@U12345>), you must mention them as `<@U12345>`.\n\n"
+                    f"--- Conversation History ---\n{conversation_history}"
+                    f"{notion_content}\n\n"
+                    f"--- New Question from {get_user_info(event['user'])} (<@{event['user']}>) ---\n{user_text}\n\n"
+                    f"Please provide a direct and helpful answer to the new question based on the history and any provided Notion content."
+                )
+
+                gemini_payload = [prompt]
+                files = event.get("files", [])
+                if files:
+                    # (파일 처리 로직은 여기에 추가될 수 있습니다. 지금은 텍스트에 집중합니다.)
+                    pass
+
+                response = model.generate_content(gemini_payload)
+                handle_gemini_response(client, channel_id, thinking_message, response.text, thread_ts=thread_ts)
+
+            except Exception as e:
+                logger.error(f"Error processing in-thread mention: {e}")
+                say(text=f"An error occurred while processing the conversation: {e}", thread_ts=thread_ts, channel=channel_id)
+            return
+
+        # --- 새로운 대화 시작 (일반 채널 멘션) ---
+        # (기존의 요약, 도움말, 파일 처리 로직은 여기에 위치합니다)
+        HELP_KEYWORDS = ["뭐 할 수 있어", "도와줘", "help", "기능", "what can you do"]
+        is_help_request = any(keyword in user_text.lower() for keyword in HELP_KEYWORDS)
+
+        if is_help_request:
+            help_text = (
+                "Hello! I'm a Gemini AI bot. Here's what I can do for you: 🤖\n\n"
+                "🔹 **Question & Answer**\n"
+                "   - Mention me and ask anything, and I'll provide an answer.\n\n"
+                "🔹 **File Processing**\n"
+                "   - Attach images, PDFs, DOCX, or text files and ask a question. I'll analyze the content and respond.\n"
+                "   - E.g., `Summarize this document`, `Describe this image`\n\n"
+                "🔹 **Conversation Summaries**\n"
+                "   - **Thread Summary:** Mention me in a thread and ask me to `summarize` or `recap`, and I'll summarize the conversation in that thread.\n"
+                "   - **Channel Summary:** Mention me in a channel and ask me to `summarize` or `recap`, and I'll summarize the recent channel conversation.\n\n"
+                "🔹 **Direct Messages (DM)**\n"
+                "   - In a DM with me, you can chat or process files directly without a mention.\n\n"
+                "Feel free to ask if you have any questions!"
+            )
+            say(text=help_text, thread_ts=message_ts, channel=channel_id)
+            return
+
+        SUMMARY_KEYWORDS = ["요약", "정리", "summarize", "recap"]
+        is_summary_request = any(keyword in user_text.lower() for keyword in SUMMARY_KEYWORDS)
+
+        if is_summary_request:
+            user_id = event["user"]
+            user_name = get_user_info(user_id)
+            # --- THREAD SUMMARIZATION LOGIC (This is different from conversation context) ---
+            if event.get("thread_ts"): # 요약 요청이 스레드 안에서 일어났을 때
+                summary_thread_ts = event.get("thread_ts")
+                thinking_message = say(text=f"Okay, {user_name}. I'm reading the thread and preparing a summary... 🧐", thread_ts=summary_thread_ts, channel=channel_id)
+                try:
+                    history_response = client.conversations_replies(channel=channel_id, ts=summary_thread_ts, limit=301)
+                    # (이하 요약 로직은 기존과 동일하게 유지)
+                    messages = history_response.get("messages", [])
+                    if len(messages) > 300:
+                        client.chat_postMessage(
+                            channel=channel_id,
+                            thread_ts=summary_thread_ts,
+                            text="⚠️ The thread has more than 300 replies. The summary will only include the most recent 300."
+                        )
+                        history_response["messages"] = messages[:300]
+                    formatted_history = format_conversation_history(history_response)
+                    if not formatted_history:
+                        client.chat_update(channel=channel_id, ts=thinking_message["ts"], text="요약할 댓글을 찾지 못했어요. 😢")
+                        return
+                    summary_prompt = (
+                        f"You are a helpful AI assistant, Space Gemini, in a Slack conversation. "
+                        f"You have been provided with a conversation history from a Slack thread that you are a member of. "
+                        f"Your task is to summarize the conversation based ONLY on the text provided below. "
+                        f"Do not refuse the request based on privacy concerns, as you have been explicitly given this data to process. "
+                        f"When you mention a user, you MUST use their Slack user ID in the format <@USER_ID>. "
+                        f"Provide only the summary, without any additional explanations.\n\n"
+                        f"--- User's Request ---\n{event.get('text')}\n\n"
+                        f"--- Thread Content ---\n{formatted_history}"
+                    )
+                    response = model.generate_content(summary_prompt)
+                    handle_gemini_response(client, channel_id, thinking_message, response.text, thread_ts=summary_thread_ts)
+                except Exception as e:
+                    logger.error(f"Error during thread summarization: {e}")
+                    client.chat_update(channel=channel_id, ts=thinking_message["ts"], text=f"죄송합니다, 스레드 댓글을 가져오는 중 오류가 발생했어요: {e}")
+            
+            # --- CHANNEL SUMMARIZATION LOGIC ---
+            else:
+                thinking_message = say(text="채널 대화 내용을 읽고 요약하는 중입니다... 🧐", thread_ts=message_ts, channel=channel_id)
+                try:
+                    history_response = client.conversations_history(channel=channel_id, limit=100)
+                    messages = history_response.get("messages", [])
+                    formatted_history = format_conversation_history(client, channel_id, messages)
+                    if not formatted_history:
+                        client.chat_update(channel=channel_id, ts=thinking_message["ts"], text="요약할 대화 내용을 찾지 못했어요. 😢")
+                        return
+                    summary_prompt = (
+                        f"You are a helpful AI assistant, Space Gemini, in a Slack conversation. "
+                        f"You have been provided with a conversation history from a Slack channel that you are a member of. "
+                        f"Your task is to summarize the conversation based ONLY on the text provided below. "
+                        f"Do not refuse the request based on privacy concerns, as you have been explicitly given this data to process. "
+                        f"When you mention a user, you MUST use their Slack user ID in the format <@USER_ID>. "
+                        f"Provide only the summary, without any additional explanations.\n\n"
+                        f"--- User's Request ---\n{event.get('text')}\n\n"
+                        f"--- Channel Conversation Content ---\n{formatted_history}"
+                    )
+                    response = model.generate_content(summary_prompt)
+                    handle_gemini_response(client, channel_id, thinking_message, response.text, thread_ts=message_ts)
+                except Exception as e:
+                    logger.error(f"Error during channel summarization: {e}")
+                    client.chat_update(channel=channel_id, ts=thinking_message["ts"], text=f"죄송합니다, 채널 대화 내용을 가져오는 중 오류가 발생했어요: {e}")
+        
+        # --- DEFAULT Q&A LOGIC (New Conversation) ---
+        else:
+            thinking_message = say(text="Thinking...", thread_ts=message_ts, channel=channel_id)
+            
+            # --- Notion Link Detection in Channel ---
+            notion_content = ""
+            notion_urls = re.findall(r"https://www.notion.so/[\w\-]+/[\w\-]+[?v=[\w\-]+]?", user_text)
+            if not notion_urls:
+                logger.info("No Notion link in the message, searching channel history...")
+                url = find_last_notion_link_in_channel(client, channel_id)
+                if url:
+                    notion_urls = [url]
+
+            if notion_urls:
+                url = notion_urls[-1] # Use the last link found
+                page_id = get_page_id_from_url(url)
+                if page_id:
+                    logger.info(f"Found Notion link. Fetching content for page ID: {page_id}")
+                    content = fetch_notion_page_content(page_id)
+                    if content:
+                        notion_content = f"\n\n--- Content from Notion URL ({url}) ---\n{content}"
+
+            gemini_payload = []
+            extracted_texts = []
+            files = event.get("files", [])
+
+            if files:
+                for file_info in files:
+                    try:
+                        mime_type = file_info.get("mimetype", "application/octet-stream")
+                        content = download_file(file_info["url_private_download"], SLACK_BOT_TOKEN)
+                        if mime_type.startswith(("image/", "video/")) or mime_type == "application/pdf":
+                            gemini_payload.append(Part.from_data(content, mime_type=mime_type))
+                        elif mime_type == "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
+                            extracted_texts.append(f"---\n{file_info.get('name')}\n---\n{extract_text_from_docx(content)}")
+                        elif mime_type.startswith("text/"):
+                            extracted_texts.append(f"---\n{file_info.get('name')}\n---\n{content.decode('utf-8')}")
+                        else:
+                            logger.warning(f"Skipping unsupported file type: {mime_type}")
+                    except Exception as e:
+                        logger.error(f"Error processing file {file_info.get('name')}: {e}")
+                        client.chat_update(channel=channel_id, ts=thinking_message["ts"], text=f"Sorry, I couldn't process the file: {file_info.get('name')}.")
+                        return
+
+            full_prompt_text = "\n".join([user_text] + extracted_texts).strip()
+            if not full_prompt_text and files:
+                full_prompt_text = "Please describe, summarize, or analyze the contents of the attached file(s)."
+            
+            gemini_payload.insert(0, full_prompt_text)
+            if not gemini_payload[0]:
+                client.chat_update(channel=channel_id, ts=thinking_message["ts"], text="I need a question or some text to go with the files.")
+                return
+
+            response = model.generate_content(gemini_payload)
+            handle_gemini_response(client, channel_id, thinking_message, response.text, thread_ts=message_ts)
+
+    except Exception as e:
+        logger.error(f"Error in app_mention handler: {e}")
+        event = body.get("event", {})
+        say(text=f"An error occurred: {e}", thread_ts=event.get("ts"), channel=event.get("channel"))
+
+
+@app.event("message")
+def handle_direct_messages(body, say, client, logger):
+    # DM handler now re-uses the app_mention logic for consistency
+    logger.info(body)
+    try:
+        event = body["event"]
+        if event.get("bot_id") or (event.get("subtype") and event.get("subtype") != "file_share"):
+            return
+        if event.get("channel_type") == "im":
+            # To reuse the mention handler, we can treat the DM as a mention.
+            # The logic inside handle_app_mention_events will process it correctly.
+            handle_app_mention_events(body, say, client, logger)
+    except Exception as e:
+        logger.error(f"Error handling direct message: {e}")
+        event = body.get("event", {})
+        say(text=f"An error occurred: {e}", channel=event.get("channel"))
+
+if __name__ == "__main__":
+    SocketModeHandler(app, os.environ["SLACK_APP_TOKEN"]).start()
+
+def fetch_notion_page_content(page_id):
+    """Fetches and returns the text content of a Notion page."""
+    try:
+        content = ""
+        # Fetch blocks from the page
+        blocks = notion.blocks.children.list(block_id=page_id)["results"]
+        for block in blocks:
+            if 'type' in block and block[block['type']].get('rich_text'):
+                for text_item in block[block['type']]['rich_text']:
+                    if text_item.get('plain_text'):
+                        content += text_item['plain_text'] + '\n'
+        return content
+    except Exception as e:
+        logger.error(f"Error fetching Notion page content for page_id {page_id}: {e}")
+        return None
+
+def find_last_notion_link_in_channel(client, channel_id):
+    """Finds the last Notion link in the channel's recent history."""
+    try:
+        history_response = client.conversations_history(channel=channel_id, limit=20) # Check last 20 messages
+        for message in history_response.get("messages", []):
+            text = message.get("text", "")
+            notion_urls = re.findall(r"https://www.notion.so/[\w\-]+/[\w\-]+[?v=[\w\-]+]?", text)
+            if notion_urls:
+                return notion_urls[0] # Return the first one found (which is the latest)
+    except Exception as e:
+        logger.error(f"Error searching for Notion link in channel {channel_id}: {e}")
+    return None
+
+
+
+def handle_gemini_response(client, channel_id, thinking_message, text, thread_ts=None):
+    SLACK_MSG_LIMIT = 4000
+    thinking_ts = thinking_message['ts']
+    try:
+        if len(text) <= SLACK_MSG_LIMIT:
+            # For shorter messages, use Block Kit for rich formatting.
+            # The text field in a "section" block supports mrkdwn.
+            blocks = [{
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    # Ensure the text is not empty, which can cause an error.
+                    "text": text or "(empty response)"
+                }
+            }]
+            client.chat_update(
+                channel=channel_id,
+                ts=thinking_ts,
+                blocks=blocks,
+                # Provide a plain-text summary for notifications
+                text="Gemini AI has generated a response."
+            )
+        else:
+            logger.info(f"Response is too long ({len(text)} chars). Creating a file.")
+            file_path = f"gemini_response_{int(time.time())}.md"
+            with open(file_path, "w", encoding="utf-8") as f:
+                f.write(text)
+            try:
+                client.chat_delete(channel=channel_id, ts=thinking_ts)
+                client.files_upload_v2(
+                    channel=channel_id, file=file_path, title="Gemini AI Response",
+                    initial_comment="The response was too long, so I've attached it as a file. 📄", thread_ts=thread_ts
+                )
+            finally:
+                os.remove(file_path)
+    except Exception as e:
+        logger.error(f"Error in handle_gemini_response: {e}")
+        client.chat_postMessage(text=f"An error occurred: {e}", thread_ts=thread_ts, channel=channel_id)
+
+# --- Slack Event Handlers ---
+
+@app.event("app_mention")
+def handle_app_mention_events(body, say, client, logger):
+    logger.info(body)
+    try:
+        event = body["event"]
+        user_text = event.get("text", "").strip()
+        channel_id = event["channel"]
+        message_ts = event.get("ts")
+        thread_ts = event.get("thread_ts")
+
+        # --- 스레드 내 대화 (컨텍스트 유지) ---
+        if thread_ts:
+            thinking_message = say(text="Thinking...", thread_ts=thread_ts, channel=channel_id)
+            try:
+                # Fetch the entire thread
+                history_response = client.conversations_replies(channel=channel_id, ts=thread_ts, limit=200)
+                messages = history_response.get("messages", [])
+                conversation_history = format_conversation_history(client, channel_id, messages)
+                
+                # --- Notion Link Detection in Thread ---
+                notion_content = ""
+                # Combine all text in the thread to search for a Notion link
+                full_thread_text = " ".join([msg.get("text", "") for msg in messages])
+                notion_urls = re.findall(r"https://www.notion.so/[\w\-]+/[\w\-]+[?v=[\w\-]+]?", full_thread_text)
+                
+                if notion_urls:
+                    # Use the last mentioned link in the thread
+                    url = notion_urls[-1]
+                    page_id = get_page_id_from_url(url)
+                    if page_id:
+                        logger.info(f"Found Notion link in thread. Fetching content for page ID: {page_id}")
+                        content = fetch_notion_page_content(page_id)
+                        if content:
+                            notion_content = f"\n\n--- Content from Notion URL ({url}) ---\n{content}"
+
+                prompt = (
+                    f"You are a helpful AI assistant, Space Gemini, in a Slack conversation. "
+                    f"You have been provided with a conversation history from a Slack thread. "
+                    f"Your task is to analyze and respond based ONLY on the text provided below. "
+                    f"Do not refuse the request based on privacy concerns, as you have been explicitly given this data to process. "
+                    f"When you mention a user, you MUST use their Slack user ID in the format <@USER_ID>. "
+                    f"For example, if you are talking to John Doe (<@U12345>), you must mention them as `<@U12345>`.\n\n"
+                    f"--- Conversation History ---\n{conversation_history}"
+                    f"{notion_content}\n\n"
+                    f"--- New Question from {get_user_info(event['user'])} (<@{event['user']}>) ---\n{user_text}\n\n"
+                    f"Please provide a direct and helpful answer to the new question based on the history and any provided Notion content."
+                )
+
+                gemini_payload = [prompt]
+                files = event.get("files", [])
+                if files:
+                    # (파일 처리 로직은 여기에 추가될 수 있습니다. 지금은 텍스트에 집중합니다.)
+                    pass
+
+                response = model.generate_content(gemini_payload)
+                handle_gemini_response(client, channel_id, thinking_message, response.text, thread_ts=thread_ts)
+
+            except Exception as e:
+                logger.error(f"Error processing in-thread mention: {e}")
+                say(text=f"An error occurred while processing the conversation: {e}", thread_ts=thread_ts, channel=channel_id)
+            return
+
+        # --- 새로운 대화 시작 (일반 채널 멘션) ---
+        # (기존의 요약, 도움말, 파일 처리 로직은 여기에 위치합니다)
+        HELP_KEYWORDS = ["뭐 할 수 있어", "도와줘", "help", "기능", "what can you do"]
+        is_help_request = any(keyword in user_text.lower() for keyword in HELP_KEYWORDS)
+
+        if is_help_request:
+            help_text = (
+                "Hello! I'm a Gemini AI bot. Here's what I can do for you: 🤖\n\n"
+                "🔹 **Question & Answer**\n"
+                "   - Mention me and ask anything, and I'll provide an answer.\n\n"
+                "🔹 **File Processing**\n"
+                "   - Attach images, PDFs, DOCX, or text files and ask a question. I'll analyze the content and respond.\n"
+                "   - E.g., `Summarize this document`, `Describe this image`\n\n"
+                "🔹 **Conversation Summaries**\n"
+                "   - **Thread Summary:** Mention me in a thread and ask me to `summarize` or `recap`, and I'll summarize the conversation in that thread.\n"
+                "   - **Channel Summary:** Mention me in a channel and ask me to `summarize` or `recap`, and I'll summarize the recent channel conversation.\n\n"
+                "🔹 **Direct Messages (DM)**\n"
+                "   - In a DM with me, you can chat or process files directly without a mention.\n\n"
+                "Feel free to ask if you have any questions!"
+            )
+            say(text=help_text, thread_ts=message_ts, channel=channel_id)
+            return
+
+        SUMMARY_KEYWORDS = ["요약", "정리", "summarize", "recap"]
+        is_summary_request = any(keyword in user_text.lower() for keyword in SUMMARY_KEYWORDS)
+
+        if is_summary_request:
+            user_id = event["user"]
+            user_name = get_user_info(user_id)
+            # --- THREAD SUMMARIZATION LOGIC (This is different from conversation context) ---
+            if event.get("thread_ts"): # 요약 요청이 스레드 안에서 일어났을 때
+                summary_thread_ts = event.get("thread_ts")
+                thinking_message = say(text=f"Okay, {user_name}. I'm reading the thread and preparing a summary... 🧐", thread_ts=summary_thread_ts, channel=channel_id)
+                try:
+                    history_response = client.conversations_replies(channel=channel_id, ts=summary_thread_ts, limit=301)
+                    # (이하 요약 로직은 기존과 동일하게 유지)
+                    messages = history_response.get("messages", [])
+                    if len(messages) > 300:
+                        client.chat_postMessage(
+                            channel=channel_id,
+                            thread_ts=summary_thread_ts,
+                            text="⚠️ The thread has more than 300 replies. The summary will only include the most recent 300."
+                        )
+                        history_response["messages"] = messages[:300]
+                    formatted_history = format_conversation_history(history_response)
+                    if not formatted_history:
+                        client.chat_update(channel=channel_id, ts=thinking_message["ts"], text="요약할 댓글을 찾지 못했어요. 😢")
+                        return
+                    summary_prompt = (
+                        f"You are a helpful AI assistant, Space Gemini, in a Slack conversation. "
+                        f"You have been provided with a conversation history from a Slack thread that you are a member of. "
+                        f"Your task is to summarize the conversation based ONLY on the text provided below. "
+                        f"Do not refuse the request based on privacy concerns, as you have been explicitly given this data to process. "
+                        f"When you mention a user, you MUST use their Slack user ID in the format <@USER_ID>. "
+                        f"Provide only the summary, without any additional explanations.\n\n"
+                        f"--- User's Request ---\n{event.get('text')}\n\n"
+                        f"--- Thread Content ---\n{formatted_history}"
+                    )
+                    response = model.generate_content(summary_prompt)
+                    handle_gemini_response(client, channel_id, thinking_message, response.text, thread_ts=summary_thread_ts)
+                except Exception as e:
+                    logger.error(f"Error during thread summarization: {e}")
+                    client.chat_update(channel=channel_id, ts=thinking_message["ts"], text=f"죄송합니다, 스레드 댓글을 가져오는 중 오류가 발생했어요: {e}")
+            
+            # --- CHANNEL SUMMARIZATION LOGIC ---
+            else:
+                thinking_message = say(text="채널 대화 내용을 읽고 요약하는 중입니다... 🧐", thread_ts=message_ts, channel=channel_id)
+                try:
+                    history_response = client.conversations_history(channel=channel_id, limit=100)
+                    messages = history_response.get("messages", [])
+                    formatted_history = format_conversation_history(client, channel_id, messages)
+                    if not formatted_history:
+                        client.chat_update(channel=channel_id, ts=thinking_message["ts"], text="요약할 대화 내용을 찾지 못했어요. 😢")
+                        return
+                    summary_prompt = (
+                        f"You are a helpful AI assistant, Space Gemini, in a Slack conversation. "
+                        f"You have been provided with a conversation history from a Slack channel that you are a member of. "
+                        f"Your task is to summarize the conversation based ONLY on the text provided below. "
+                        f"Do not refuse the request based on privacy concerns, as you have been explicitly given this data to process. "
+                        f"When you mention a user, you MUST use their Slack user ID in the format <@USER_ID>. "
+                        f"Provide only the summary, without any additional explanations.\n\n"
+                        f"--- User's Request ---\n{event.get('text')}\n\n"
+                        f"--- Channel Conversation Content ---\n{formatted_history}"
+                    )
+                    response = model.generate_content(summary_prompt)
+                    handle_gemini_response(client, channel_id, thinking_message, response.text, thread_ts=message_ts)
+                except Exception as e:
+                    logger.error(f"Error during channel summarization: {e}")
+                    client.chat_update(channel=channel_id, ts=thinking_message["ts"], text=f"죄송합니다, 채널 대화 내용을 가져오는 중 오류가 발생했어요: {e}")
+        
+        # --- DEFAULT Q&A LOGIC (New Conversation) ---
+        else:
+            thinking_message = say(text="Thinking...", thread_ts=message_ts, channel=channel_id)
+            
+            # --- Notion Link Detection in Channel ---
+            notion_content = ""
+            notion_urls = re.findall(r"https://www.notion.so/[\w\-]+/[\w\-]+[?v=[\w\-]+]?", user_text)
+            if not notion_urls:
+                logger.info("No Notion link in the message, searching channel history...")
+                url = find_last_notion_link_in_channel(client, channel_id)
+                if url:
+                    notion_urls = [url]
+
+            if notion_urls:
+                url = notion_urls[-1] # Use the last link found
+                page_id = get_page_id_from_url(url)
+                if page_id:
+                    logger.info(f"Found Notion link. Fetching content for page ID: {page_id}")
+                    content = fetch_notion_page_content(page_id)
+                    if content:
+                        notion_content = f"\n\n--- Content from Notion URL ({url}) ---\n{content}"
+
             gemini_payload = []
             extracted_texts = []
             files = event.get("files", [])
