@@ -136,7 +136,7 @@ def fetch_notion_page_content(page_id):
     try:
         content = ""
         # Fetch blocks from the page
-        blocks = notion.blocks.children.list(block_id=page_id)["results"]
+        blocks = notion.blocks.children.list(block_id=page_id)[ "results"]
         for block in blocks:
             if 'type' in block and block[block['type']].get('rich_text'):
                 for text_item in block[block['type']]['rich_text']:
@@ -159,6 +159,27 @@ def find_last_notion_link_in_channel(client, channel_id):
     except Exception as e:
         logger.error(f"Error searching for Notion link in channel {channel_id}: {e}")
     return None
+
+def process_attachments(event):
+    gemini_payload = []
+    extracted_texts = []
+    if event.get("files"):
+        for file_info in event["files"]:
+            try:
+                mime_type = file_info.get("mimetype", "application/octet-stream")
+                content = download_file(file_info["url_private_download"], SLACK_BOT_TOKEN)
+                if mime_type.startswith(("image/", "video/")) or mime_type == "application/pdf":
+                    gemini_payload.append(Part.from_data(content, mime_type=mime_type))
+                elif mime_type == "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
+                    extracted_texts.append(f"---\n{file_info.get('name')}\n---\n{extract_text_from_docx(content)}")
+                elif mime_type.startswith("text/"):
+                    extracted_texts.append(f"---\n{file_info.get('name')}\n---\n{content.decode('utf-8')}")
+                else:
+                    logger.warning(f"Skipping unsupported file type: {mime_type}")
+            except Exception as e:
+                logger.error(f"Error processing file {file_info.get('name')}: {e}")
+                # Optionally, notify the user about the error
+    return gemini_payload, extracted_texts
 
 def handle_gemini_response(client, channel_id, thinking_message, text, thread_ts=None):
     SLACK_MSG_LIMIT = 4000
@@ -215,6 +236,8 @@ def handle_app_mention_events(body, say, client, logger):
                 messages = history_response.get("messages", [])
                 conversation_history = format_conversation_history(client, channel_id, messages)
                 
+                gemini_payload, extracted_texts = process_attachments(event)
+
                 notion_content = ""
                 full_thread_text = " ".join([msg.get("text", "") for msg in messages])
                 notion_urls = re.findall(r"https://www.notion.so/[\w\-./]+", full_thread_text)
@@ -228,20 +251,23 @@ def handle_app_mention_events(body, say, client, logger):
                         if content:
                             notion_content = f"\n\n--- Content from Notion URL ({url}) ---\n{content}"
 
-                prompt = (
+                prompt_text = (
                     f"You are a helpful AI assistant, Space Gemini, in a Slack conversation. "
                     f"You have been provided with a conversation history from a Slack thread. "
                     f"Your task is to analyze and respond based ONLY on the text provided below. "
                     f"Do not refuse the request based on privacy concerns, as you have been explicitly given this data to process. "
                     f"When you mention a user, you MUST use their Slack user ID in the format <@USER_ID>. "
-                    f"For example, if you are talking to John Doe (<@U12345>), you must mention them as `<@U12345>`.\n\n"
+                    f"For example, if you are talking to John Doe (<@U12345>), you must mention them as `<@U12345>`."
                     f"--- Conversation History ---\n{conversation_history}"
                     f"{notion_content}\n\n"
                     f"--- New Question from {get_user_info(event['user'])} (<@{event['user']}>) ---\n{user_text}\n\n"
                     f"Please provide a direct and helpful answer to the new question based on the history and any provided Notion content."
                 )
+                
+                full_prompt_text = "\n".join([prompt_text] + extracted_texts).strip()
+                gemini_payload.insert(0, full_prompt_text)
 
-                response = model.generate_content([prompt])
+                response = model.generate_content(gemini_payload)
                 handle_gemini_response(client, channel_id, thinking_message, response.text, thread_ts=thread_ts)
 
             except Exception as e:
@@ -300,28 +326,8 @@ def handle_app_mention_events(body, say, client, logger):
         # --- Default Q&A with File/Notion Processing ---
         thinking_message = say(text="Thinking...", thread_ts=message_ts, channel=channel_id)
         
-        gemini_payload = []
-        extracted_texts = []
+        gemini_payload, extracted_texts = process_attachments(event)
         
-        # File Processing
-        if event.get("files"):
-            for file_info in event["files"]:
-                try:
-                    mime_type = file_info.get("mimetype", "application/octet-stream")
-                    content = download_file(file_info["url_private_download"], SLACK_BOT_TOKEN)
-                    if mime_type.startswith(("image/", "video/")) or mime_type == "application/pdf":
-                        gemini_payload.append(Part.from_data(content, mime_type=mime_type))
-                    elif mime_type == "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
-                        extracted_texts.append(f"---\n{file_info.get('name')}\n---\n{extract_text_from_docx(content)}")
-                    elif mime_type.startswith("text/"):
-                        extracted_texts.append(f"---\n{file_info.get('name')}\n---\n{content.decode('utf-8')}")
-                    else:
-                        logger.warning(f"Skipping unsupported file type: {mime_type}")
-                except Exception as e:
-                    logger.error(f"Error processing file {file_info.get('name')}: {e}")
-                    client.chat_update(channel=channel_id, ts=thinking_message["ts"], text=f"Sorry, I couldn't process the file: {file_info.get('name')}.")
-                    return
-
         # Notion Link Processing
         notion_content = ""
         notion_urls = re.findall(r"https://www.notion.so/[\w\-./]+", user_text)
