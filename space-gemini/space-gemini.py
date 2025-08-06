@@ -168,14 +168,14 @@ def handle_app_mention_events(body, say, client, logger):
                 conversation_history = format_conversation_history(client, channel_id, messages)
                 
                 prompt = (
-                    f"You are a helpful AI assistant in a Slack conversation. "
-                    f"Your name is Space Gemini. "
+                    f"You are a helpful AI assistant, Space Gemini, in a Slack conversation. "
+                    f"You have been provided with a conversation history from a Slack thread that you are a member of. "
+                    f"Your task is to analyze and respond based ONLY on the text provided below. "
+                    f"Do not refuse the request based on privacy concerns, as you have been explicitly given this data to process. "
                     f"When you mention a user, you MUST use their Slack user ID in the format <@USER_ID>. "
-                    f"For example, if you are talking to John Doe (<@U12345>), you must mention them as `<@U12345>`."
-                    f"Continue the following Slack conversation, paying close attention to the context. "
-                    f"The user is asking a follow-up question in a thread.\n\n"
-                    f"--- Conversation History ---\n{conversation_history}\n\n"
-                    f"--- New Question from {get_user_info(event['user'])} (<@{event['user']}>) ---{user_text}\n\n"
+                    f"For example, if you are talking to John Doe (<@U12345>), you must mention them as `<@U12345>`. "
+                    f"--- Conversation History ---{conversation_history}"
+                    f"--- New Question from {get_user_info(event['user'])} (<@{event['user']}>) ---{user_text}"
                     f"Please provide a direct and helpful answer to the new question based on the history."
                 )
 
@@ -242,10 +242,11 @@ def handle_app_mention_events(body, say, client, logger):
                         client.chat_update(channel=channel_id, ts=thinking_message["ts"], text="요약할 댓글을 찾지 못했어요. 😢")
                         return
                     summary_prompt = (
-                        f"You are a helpful AI assistant in a Slack conversation. "
-                        f"Your name is Space Gemini. "
+                        f"You are a helpful AI assistant, Space Gemini, in a Slack conversation. "
+                        f"You have been provided with a conversation history from a Slack thread that you are a member of. "
+                        f"Your task is to summarize the conversation based ONLY on the text provided below. "
+                        f"Do not refuse the request based on privacy concerns, as you have been explicitly given this data to process. "
                         f"When you mention a user, you MUST use their Slack user ID in the format <@USER_ID>. "
-                        f"Summarize the following Slack thread conversation. "
                         f"Provide only the summary, without any additional explanations.\n\n"
                         f"--- User's Request ---\n{event.get('text')}\n\n"
                         f"--- Thread Content ---\n{formatted_history}"
@@ -267,10 +268,11 @@ def handle_app_mention_events(body, say, client, logger):
                         client.chat_update(channel=channel_id, ts=thinking_message["ts"], text="요약할 대화 내용을 찾지 못했어요. 😢")
                         return
                     summary_prompt = (
-                        f"You are a helpful AI assistant in a Slack conversation. "
-                        f"Your name is Space Gemini. "
+                        f"You are a helpful AI assistant, Space Gemini, in a Slack conversation. "
+                        f"You have been provided with a conversation history from a Slack channel that you are a member of. "
+                        f"Your task is to summarize the conversation based ONLY on the text provided below. "
+                        f"Do not refuse the request based on privacy concerns, as you have been explicitly given this data to process. "
                         f"When you mention a user, you MUST use their Slack user ID in the format <@USER_ID>. "
-                        f"Summarize the following Slack channel conversation. "
                         f"Provide only the summary, without any additional explanations.\n\n"
                         f"--- User's Request ---\n{event.get('text')}\n\n"
                         f"--- Channel Conversation Content ---\n{formatted_history}"
