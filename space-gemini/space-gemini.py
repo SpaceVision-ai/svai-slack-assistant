@@ -44,8 +44,7 @@ def get_user_info(user_id):
             user_cache[user_id] = user_id # Fallback to user_id
     return user_cache[user_id]
 
-def format_conversation_history(history_response):
-    messages = history_response.get("messages", [])
+def format_conversation_history(client, channel_id, messages):
     if not messages:
         return ""
     
@@ -65,6 +64,22 @@ def format_conversation_history(history_response):
         
         if text: # Only add messages that have content after cleaning
             formatted_messages.append(f"{user_name}: {text}")
+
+        # If the message has replies, fetch the thread
+        if msg.get("reply_count", 0) > 0:
+            thread_ts = msg.get("thread_ts", msg.get("ts"))
+            try:
+                replies_response = client.conversations_replies(channel=channel_id, ts=thread_ts, limit=200)
+                # Skip the parent message (already added) and format replies
+                for reply in replies_response.get("messages", [])[1:]:
+                    if "user" in reply and "text" in reply:
+                        reply_user_name = get_user_info(reply["user"])
+                        reply_text = re.sub(r'<@U[A-Z0-9]+>', '', reply["text"]).strip()
+                        if reply_text:
+                            formatted_messages.append(f"  (in thread) {reply_user_name}: {reply_text}")
+            except Exception as e:
+                logger.error(f"Error fetching replies for thread {thread_ts}: {e}")
+
             
     return "\n".join(formatted_messages)
 
@@ -150,7 +165,8 @@ def handle_app_mention_events(body, say, client, logger):
             thinking_message = say(text="Thinking...", thread_ts=thread_ts, channel=channel_id)
             try:
                 history_response = client.conversations_replies(channel=channel_id, ts=thread_ts, limit=200)
-                conversation_history = format_conversation_history(history_response)
+                messages = history_response.get("messages", [])
+                conversation_history = format_conversation_history(client, channel_id, messages)
                 
                 prompt = (
                     f"You are a helpful AI assistant. Continue the following Slack conversation, paying close attention to the context. "
@@ -239,7 +255,8 @@ def handle_app_mention_events(body, say, client, logger):
                 thinking_message = say(text="채널 대화 내용을 읽고 요약하는 중입니다... 🧐", thread_ts=message_ts, channel=channel_id)
                 try:
                     history_response = client.conversations_history(channel=channel_id, limit=100)
-                    formatted_history = format_conversation_history(history_response)
+                    messages = history_response.get("messages", [])
+                    formatted_history = format_conversation_history(client, channel_id, messages)
                     if not formatted_history:
                         client.chat_update(channel=channel_id, ts=thinking_message["ts"], text="요약할 대화 내용을 찾지 못했어요. 😢")
                         return
