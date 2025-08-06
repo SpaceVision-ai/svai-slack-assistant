@@ -44,6 +44,30 @@ def get_user_info(user_id):
             user_cache[user_id] = user_id # Fallback to user_id
     return user_cache[user_id]
 
+def format_conversation_history(history_response):
+    messages = history_response.get("messages", [])
+    if not messages:
+        return ""
+    
+    formatted_messages = []
+    # The history is returned newest-first, so we reverse it for chronological order.
+    for msg in reversed(messages):
+        # Skip non-user messages or messages without text
+        if "user" not in msg or "text" not in msg:
+            continue
+        
+        user_id = msg["user"]
+        user_name = get_user_info(user_id)
+        text = msg["text"]
+        
+        # Clean up mentions from the text
+        text = re.sub(r'<@U[A-Z0-9]+>', '', text).strip()
+        
+        if text: # Only add messages that have content after cleaning
+            formatted_messages.append(f"{user_name}: {text}")
+            
+    return "\n".join(formatted_messages)
+
 # --- Helper Functions ---
 
 def download_file(url, token):
@@ -70,7 +94,7 @@ def extract_text_from_pdf(content):
         logger.error(f"Error extracting text from PDF: {e}")
         return ""
 
-def handle_gemini_response(app, channel_id, thinking_message, text, thread_ts=None):
+def handle_gemini_response(client, channel_id, thinking_message, text, thread_ts=None):
     SLACK_MSG_LIMIT = 4000
     thinking_ts = thinking_message['ts']
     try:
@@ -85,12 +109,12 @@ def handle_gemini_response(app, channel_id, thinking_message, text, thread_ts=No
                     "text": text or "(empty response)"
                 }
             }]
-            app.client.chat_update(
+            client.chat_update(
                 channel=channel_id,
                 ts=thinking_ts,
                 blocks=blocks,
                 # Provide a plain-text summary for notifications
-                text="Gemini AI가 답변을 생성했습니다."
+                text="Gemini AI has generated a response."
             )
         else:
             logger.info(f"Response is too long ({len(text)} chars). Creating a file.")
@@ -98,140 +122,106 @@ def handle_gemini_response(app, channel_id, thinking_message, text, thread_ts=No
             with open(file_path, "w", encoding="utf-8") as f:
                 f.write(text)
             try:
-                app.client.chat_delete(channel=channel_id, ts=thinking_ts)
-                app.client.files_upload_v2(
+                client.chat_delete(channel=channel_id, ts=thinking_ts)
+                client.files_upload_v2(
                     channel=channel_id, file=file_path, title="Gemini AI Response",
-                    initial_comment="답변이 길어서 파일로 첨부해 드렸어요. 📄", thread_ts=thread_ts
+                    initial_comment="The response was too long, so I've attached it as a file. 📄", thread_ts=thread_ts
                 )
             finally:
                 os.remove(file_path)
     except Exception as e:
         logger.error(f"Error in handle_gemini_response: {e}")
-        app.client.chat_postMessage(text=f"An error occurred: {e}", thread_ts=thread_ts, channel=channel_id)
-
-# --- Main Event Processing Logic ---
-
-def format_conversation_history(history):
-    messages = history.get("messages", [])
-    formatted_lines = []
-    # Process messages in reverse order to have the oldest first
-    for msg in reversed(messages):
-        # Skip bot messages or messages with no user
-        if msg.get("bot_id") or not msg.get("user"):
-            continue
-        user_name = get_user_info(msg["user"])
-        text = msg.get("text", "")
-        formatted_lines.append(f"{user_name}: {text}")
-    return "\n".join(formatted_lines)
-
-def process_event(event, say):
-    # This function now handles simple Q&A and file processing
-    # The history summarization is handled in the app_mention handler directly
-    user_text = event.get("text", "")
-    channel_id = event["channel"]
-    thread_ts = event.get("ts")
-    files = event.get("files", [])
-
-    if not user_text and not files:
-        return
-
-    thinking_message = say(text="Thinking...", thread_ts=thread_ts, channel=channel_id)
-    gemini_payload = []
-    extracted_texts = []
-
-    if files:
-        for file_info in files:
-            try:
-                mime_type = file_info.get("mimetype", "application/octet-stream")
-                content = download_file(file_info["url_private_download"], SLACK_BOT_TOKEN)
-                if mime_type.startswith(("image/", "video/")) or mime_type == "application/pdf":
-                    gemini_payload.append(Part.from_data(content, mime_type=mime_type))
-                elif mime_type == "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
-                    extracted_texts.append(f"---\n{file_info.get('name')}\n---\n{extract_text_from_docx(content)}")
-                elif mime_type.startswith("text/"):
-                    extracted_texts.append(f"---\n{file_info.get('name')}\n---\n{content.decode('utf-8')}")
-                else:
-                    logger.warning(f"Skipping unsupported file type: {mime_type}")
-            except Exception as e:
-                logger.error(f"Error processing file {file_info.get('name')}: {e}")
-                app.client.chat_update(channel=channel_id, ts=thinking_message["ts"], text=f"Sorry, I couldn't process the file: {file_info.get('name')}.")
-                return
-
-    full_prompt_text = "\n".join([user_text] + extracted_texts).strip()
-    if not full_prompt_text and files:
-        full_prompt_text = "Please describe, summarize, or analyze the contents of the attached file(s)."
-    
-    gemini_payload.insert(0, full_prompt_text)
-    if not gemini_payload[0]:
-        app.client.chat_update(channel=channel_id, ts=thinking_message["ts"], text="I need a question or some text to go with the files.")
-        return
-
-    response = model.generate_content(gemini_payload)
-    handle_gemini_response(app, channel_id, thinking_message, response.text, thread_ts=thread_ts)
+        client.chat_postMessage(text=f"An error occurred: {e}", thread_ts=thread_ts, channel=channel_id)
 
 # --- Slack Event Handlers ---
 
 @app.event("app_mention")
-def handle_app_mention_events(body, say, logger):
+def handle_app_mention_events(body, say, client, logger):
     logger.info(body)
     try:
         event = body["event"]
-        user_text = event.get("text", "").lower()
+        user_text = event.get("text", "").strip()
         channel_id = event["channel"]
         message_ts = event.get("ts")
         thread_ts = event.get("thread_ts")
 
+        # --- 스레드 내 대화 (컨텍스트 유지) ---
+        if thread_ts:
+            thinking_message = say(text="Thinking...", thread_ts=thread_ts, channel=channel_id)
+            try:
+                history_response = client.conversations_replies(channel=channel_id, ts=thread_ts, limit=200)
+                conversation_history = format_conversation_history(history_response)
+                
+                prompt = (
+                    f"You are a helpful AI assistant. Continue the following Slack conversation, paying close attention to the context. "
+                    f"The user is asking a follow-up question in a thread.\n\n"
+                    f"--- Conversation History ---\n{conversation_history}\n\n"
+                    f"--- New Question ---\n{user_text}\n\n"
+                    f"Please provide a direct answer to the new question based on the history."
+                )
+
+                gemini_payload = [prompt]
+                files = event.get("files", [])
+                if files:
+                    # (파일 처리 로직은 여기에 추가될 수 있습니다. 지금은 텍스트에 집중합니다.)
+                    pass
+
+                response = model.generate_content(gemini_payload)
+                handle_gemini_response(client, channel_id, thinking_message, response.text, thread_ts=thread_ts)
+
+            except Exception as e:
+                logger.error(f"Error processing in-thread mention: {e}")
+                say(text=f"An error occurred while processing the conversation: {e}", thread_ts=thread_ts, channel=channel_id)
+            return
+
+        # --- 새로운 대화 시작 (일반 채널 멘션) ---
+        # (기존의 요약, 도움말, 파일 처리 로직은 여기에 위치합니다)
         HELP_KEYWORDS = ["뭐 할 수 있어", "도와줘", "help", "기능", "what can you do"]
-        is_help_request = any(keyword in user_text for keyword in HELP_KEYWORDS)
+        is_help_request = any(keyword in user_text.lower() for keyword in HELP_KEYWORDS)
 
         if is_help_request:
             help_text = (
-                "안녕하세요! 저는 Gemini AI 봇입니다. 제가 할 수 있는 일은 다음과 같아요. 🤖\n\n"
-                "🔹 **질문 답변**\n"
-                "   - 저를 멘션하고 무엇이든 질문하시면 답변해 드려요.\n\n"
-                "🔹 **파일 처리**\n"
-                "   - 이미지, PDF, DOCX, 텍스트 파일을 첨부하고 질문하시면 내용을 분석하고 답변해 드려요.\n"
-                "   - 예: `이 문서 요약해 줘`, `이 이미지에 대해 설명해 줘`\n\n"
-                "🔹 **대화 요약**\n"
-                "   - **스레드 요약:** 특정 메시지의 스레드(댓글) 안에서 저를 멘션하고 `요약` 또는 `정리`라고 요청하시면 해당 스레드의 대화 내용을 요약해 드려요.\n"
-                "   - **채널 요약:** 채널에서 저를 멘션하고 `요약` 또는 `정리`라고 요청하시면 최근 채널 대화 내용을 요약해 드려요.\n\n"
-                "🔹 **DM (개인 메시지)**\n"
-                "   - 저와의 DM에서는 멘션 없이 바로 대화하거나 파일을 처리할 수 있어요.\n\n"
-                "궁금한 점이 있다면 언제든지 물어보세요!"
+                "Hello! I'm a Gemini AI bot. Here's what I can do for you: 🤖\n\n"
+                "🔹 **Question & Answer**\n"
+                "   - Mention me and ask anything, and I'll provide an answer.\n\n"
+                "🔹 **File Processing**\n"
+                "   - Attach images, PDFs, DOCX, or text files and ask a question. I'll analyze the content and respond.\n"
+                "   - E.g., `Summarize this document`, `Describe this image`\n\n"
+                "🔹 **Conversation Summaries**\n"
+                "   - **Thread Summary:** Mention me in a thread and ask me to `summarize` or `recap`, and I'll summarize the conversation in that thread.\n"
+                "   - **Channel Summary:** Mention me in a channel and ask me to `summarize` or `recap`, and I'll summarize the recent channel conversation.\n\n"
+                "🔹 **Direct Messages (DM)**\n"
+                "   - In a DM with me, you can chat or process files directly without a mention.\n\n"
+                "Feel free to ask if you have any questions!"
             )
             say(text=help_text, thread_ts=message_ts, channel=channel_id)
             return
 
         SUMMARY_KEYWORDS = ["요약", "정리", "summarize", "recap"]
-        is_summary_request = any(keyword in user_text for keyword in SUMMARY_KEYWORDS)
+        is_summary_request = any(keyword in user_text.lower() for keyword in SUMMARY_KEYWORDS)
 
         if is_summary_request:
             user_id = event["user"]
             user_name = get_user_info(user_id)
-            # --- THREAD SUMMARIZATION LOGIC ---
-            if thread_ts:
-                thinking_message = say(text=f"네, {user_name}님. 요청하신 스레드 댓글들을 읽고 요약하는 중입니다... 🧐", thread_ts=thread_ts, channel=channel_id)
+            # --- THREAD SUMMARIZATION LOGIC (This is different from conversation context) ---
+            if event.get("thread_ts"): # 요약 요청이 스레드 안에서 일어났을 때
+                summary_thread_ts = event.get("thread_ts")
+                thinking_message = say(text=f"Okay, {user_name}. I'm reading the thread and preparing a summary... 🧐", thread_ts=summary_thread_ts, channel=channel_id)
                 try:
-                    # Fetch up to 151 replies to check if there are more than 150
-                    history_response = app.client.conversations_replies(channel=channel_id, ts=thread_ts, limit=151)
+                    history_response = client.conversations_replies(channel=channel_id, ts=summary_thread_ts, limit=301)
+                    # (이하 요약 로직은 기존과 동일하게 유지)
                     messages = history_response.get("messages", [])
-
-                    if len(messages) > 150:
-                        # Notify the user that the thread is too long and will be truncated
-                        app.client.chat_postMessage(
+                    if len(messages) > 300:
+                        client.chat_postMessage(
                             channel=channel_id,
-                            thread_ts=thread_ts,
-                            text="⚠️ 스레드 댓글이 150개를 초과하여, 가장 최근 150개만 요약에 포함됩니다."
+                            thread_ts=summary_thread_ts,
+                            text="⚠️ The thread has more than 300 replies. The summary will only include the most recent 300."
                         )
-                        # Truncate the messages to the most recent 150
-                        history_response["messages"] = messages[:150]
-
+                        history_response["messages"] = messages[:300]
                     formatted_history = format_conversation_history(history_response)
-                    
                     if not formatted_history:
-                        app.client.chat_update(channel=channel_id, ts=thinking_message["ts"], text="요약할 댓글을 찾지 못했어요. 😢")
+                        client.chat_update(channel=channel_id, ts=thinking_message["ts"], text="요약할 댓글을 찾지 못했어요. 😢")
                         return
-
                     summary_prompt = (
                         f"다음 Slack 스레드 대화 내용을 요약해 주세요. "
                         f"다른 부가적인 설명 없이 요약된 내용만 제공해야 합니다.\n\n"
@@ -239,23 +229,20 @@ def handle_app_mention_events(body, say, logger):
                         f"--- 스레드 댓글 내용 ---\n{formatted_history}"
                     )
                     response = model.generate_content(summary_prompt)
-                    handle_gemini_response(app, channel_id, thinking_message, response.text, thread_ts=thread_ts)
-
+                    handle_gemini_response(client, channel_id, thinking_message, response.text, thread_ts=summary_thread_ts)
                 except Exception as e:
                     logger.error(f"Error during thread summarization: {e}")
-                    app.client.chat_update(channel=channel_id, ts=thinking_message["ts"], text=f"죄송합니다, 스레드 댓글을 가져오는 중 오류가 발생했어요: {e}")
+                    client.chat_update(channel=channel_id, ts=thinking_message["ts"], text=f"죄송합니다, 스레드 댓글을 가져오는 중 오류가 발생했어요: {e}")
             
             # --- CHANNEL SUMMARIZATION LOGIC ---
             else:
                 thinking_message = say(text="채널 대화 내용을 읽고 요약하는 중입니다... 🧐", thread_ts=message_ts, channel=channel_id)
                 try:
-                    history_response = app.client.conversations_history(channel=channel_id, limit=100)
+                    history_response = client.conversations_history(channel=channel_id, limit=100)
                     formatted_history = format_conversation_history(history_response)
-
                     if not formatted_history:
-                        app.client.chat_update(channel=channel_id, ts=thinking_message["ts"], text="요약할 대화 내용을 찾지 못했어요. 😢")
+                        client.chat_update(channel=channel_id, ts=thinking_message["ts"], text="요약할 대화 내용을 찾지 못했어요. 😢")
                         return
-
                     summary_prompt = (
                         f"다음 Slack 채널의 대화 내용을 요약해 주세요. "
                         f"다른 부가적인 설명 없이 요약된 내용만 제공해야 합니다.\n\n"
@@ -263,15 +250,47 @@ def handle_app_mention_events(body, say, logger):
                         f"--- 채널 대화 내용 ---\n{formatted_history}"
                     )
                     response = model.generate_content(summary_prompt)
-                    handle_gemini_response(app, channel_id, thinking_message, response.text, thread_ts=message_ts)
-
+                    handle_gemini_response(client, channel_id, thinking_message, response.text, thread_ts=message_ts)
                 except Exception as e:
                     logger.error(f"Error during channel summarization: {e}")
-                    app.client.chat_update(channel=channel_id, ts=thinking_message["ts"], text=f"죄송합니다, 채널 대화 내용을 가져오는 중 오류가 발생했어요: {e}")
+                    client.chat_update(channel=channel_id, ts=thinking_message["ts"], text=f"죄송합니다, 채널 대화 내용을 가져오는 중 오류가 발생했어요: {e}")
         
-        # --- DEFAULT Q&A LOGIC ---
+        # --- DEFAULT Q&A LOGIC (New Conversation) ---
         else:
-            process_event(event, say)
+            thinking_message = say(text="Thinking...", thread_ts=message_ts, channel=channel_id)
+            gemini_payload = []
+            extracted_texts = []
+            files = event.get("files", [])
+
+            if files:
+                for file_info in files:
+                    try:
+                        mime_type = file_info.get("mimetype", "application/octet-stream")
+                        content = download_file(file_info["url_private_download"], SLACK_BOT_TOKEN)
+                        if mime_type.startswith(("image/", "video/")) or mime_type == "application/pdf":
+                            gemini_payload.append(Part.from_data(content, mime_type=mime_type))
+                        elif mime_type == "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
+                            extracted_texts.append(f"---\n{file_info.get('name')}\n---\n{extract_text_from_docx(content)}")
+                        elif mime_type.startswith("text/"):
+                            extracted_texts.append(f"---\n{file_info.get('name')}\n---\n{content.decode('utf-8')}")
+                        else:
+                            logger.warning(f"Skipping unsupported file type: {mime_type}")
+                    except Exception as e:
+                        logger.error(f"Error processing file {file_info.get('name')}: {e}")
+                        client.chat_update(channel=channel_id, ts=thinking_message["ts"], text=f"Sorry, I couldn't process the file: {file_info.get('name')}.")
+                        return
+
+            full_prompt_text = "\n".join([user_text] + extracted_texts).strip()
+            if not full_prompt_text and files:
+                full_prompt_text = "Please describe, summarize, or analyze the contents of the attached file(s)."
+            
+            gemini_payload.insert(0, full_prompt_text)
+            if not gemini_payload[0]:
+                client.chat_update(channel=channel_id, ts=thinking_message["ts"], text="I need a question or some text to go with the files.")
+                return
+
+            response = model.generate_content(gemini_payload)
+            handle_gemini_response(client, channel_id, thinking_message, response.text, thread_ts=message_ts)
 
     except Exception as e:
         logger.error(f"Error in app_mention handler: {e}")
@@ -280,15 +299,17 @@ def handle_app_mention_events(body, say, logger):
 
 
 @app.event("message")
-def handle_direct_messages(body, say, logger):
-    # DM handler remains for simple Q&A and file attachments in DMs
+def handle_direct_messages(body, say, client, logger):
+    # DM handler now re-uses the app_mention logic for consistency
     logger.info(body)
     try:
         event = body["event"]
         if event.get("bot_id") or (event.get("subtype") and event.get("subtype") != "file_share"):
             return
         if event.get("channel_type") == "im":
-            process_event(event, say)
+            # To reuse the mention handler, we can treat the DM as a mention.
+            # The logic inside handle_app_mention_events will process it correctly.
+            handle_app_mention_events(body, say, client, logger)
     except Exception as e:
         logger.error(f"Error handling direct message: {e}")
         event = body.get("event", {})
