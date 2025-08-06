@@ -369,52 +369,65 @@ Text to translate:
             say(channel=channel_id, text=warning, thread_ts=thread_for_follow_ups)
 
         # Notion 링크 확인 및 처리
-        page_id = get_page_id_from_url(text)
-        if page_id:
-            logger.info(f"Found a Notion Page ID in the translated message: {page_id}")
-            try:
-                page = notion.pages.retrieve(page_id=page_id)
-                
-                properties = page.get('properties', {})
-                title_property = None
-                title_prop_name = None
-                for prop_name, prop_details in properties.items():
-                    if prop_details.get('type') == 'title':
-                        title_property = prop_details
-                        title_prop_name = prop_name
-                        break
-                
-                if title_property and title_prop_name:
-                    original_title = title_property.get('title', [{}])[0].get('plain_text', 'Untitled')
-                    
-                    is_already_formatted = re.search(r"\s*\([^)]+\)$", original_title)
-                    if any('가' <= char <= '힣' for char in original_title) and not is_already_formatted:
-                        prompt = f"Translate the following Korean document title to English. Respond with only the translated title, without any additional text or quotation marks. Title: '{original_title}'"
-                        title_translation_response = model.generate_content(prompt)
-                        english_title = title_translation_response.text.strip()
-                        new_title_format = f"{original_title} ({english_title})"
+        logger.info(f"Found URLs for Notion processing: {urls}")
+        for url in urls:
+            if 'notion.so' in url or 'notion.site' in url:
+                page_id = get_page_id_from_url(url)
+                logger.info(f"Processing Notion URL: {url}, Extracted Page ID: {page_id}")
+                if page_id:
+                    try:
+                        page = notion.pages.retrieve(page_id=page_id)
                         
-                        ask_to_translate_title(say, channel_id, thread_for_follow_ups, page_id, original_title, new_title_format, title_prop_name)
-                else:
-                    logger.warning(f"Could not find a title property for page ID: {page_id}")
+                        properties = page.get('properties', {})
+                        title_property = None
+                        title_prop_name = None
+                        for prop_name, prop_details in properties.items():
+                            if prop_details.get('type') == 'title':
+                                title_property = prop_details
+                                title_prop_name = prop_name
+                                break
+                        
+                        if title_property and title_prop_name:
+                            original_title = title_property.get('title', [{}])[0].get('plain_text', 'Untitled')
+                            logger.info(f"Page Title for {page_id}: '{original_title}'")
+                            
+                            is_korean = any('가' <= char <= '힣' for char in original_title)
+                            is_already_formatted = re.search(r"\s*\([^)]+\)", original_title)
+                            
+                            logger.info(f"Title check for {page_id}: Is Korean? {is_korean}, Is already formatted? {bool(is_already_formatted)}")
 
-            except notion_client.errors.APIResponseError as e:
-                if e.code == "object_not_found":
-                    error_message_kr = (
-                        ":warning: Notion 페이지에 접근할 수 없습니다. "
-                        "페이지가 존재하지 않거나, 저에게 접근 권한이 없는 것 같아요."
-                    )
-                    error_message_en = (
-                        ":warning: I can't access that Notion page. "
-                        "It might not exist, or I may not have permission."
-                    )
-                    say(channel=channel_id, thread_ts=thread_for_follow_ups, text=f"{error_message_kr}\n\n{error_message_en}")
+                            if is_korean and not is_already_formatted:
+                                logger.info(f"Condition met for {page_id}, proceeding with translation.")
+                                prompt = f"Translate the following Korean document title to English. Respond with only the translated title, without any additional text or quotation marks. Title: '{original_title}'"
+                                title_translation_response = model.generate_content(prompt)
+                                english_title = title_translation_response.text.strip()
+                                new_title_format = f"{original_title} ({english_title})"
+                                
+                                ask_to_translate_title(say, channel_id, thread_for_follow_ups, page_id, original_title, new_title_format, title_prop_name)
+                            else:
+                                logger.info(f"Skipping translation suggestion for {page_id} as conditions were not met.")
+                        else:
+                            logger.warning(f"Could not find a title property for page ID: {page_id}")
+
+                    except notion_client.errors.APIResponseError as e:
+                        if e.code == "object_not_found":
+                            error_message_kr = (
+                                f":warning: <{url}|Notion 페이지>에 접근할 수 없습니다. "
+                                "페이지가 존재하지 않거나, 저에게 접근 권한이 없는 것 같아요."
+                            )
+                            error_message_en = (
+                                f":warning: I can't access that <{url}|Notion page>. "
+                                "It might not exist, or I may not have permission."
+                            )
+                            say(channel=channel_id, thread_ts=thread_for_follow_ups, text=f"{error_message_kr}\n\n{error_message_en}")
+                        else:
+                            logger.error(f"Notion API Error for url {url}: {e}")
+                            say(channel=channel_id, thread_ts=thread_for_follow_ups, text=f":warning: An error occurred with the Notion API for <{url}>: ```{e}```")
+                    except Exception as e:
+                        logger.error(f"An unexpected error occurred while handling Notion link {url}: {e}")
+                        say(channel=channel_id, thread_ts=thread_for_follow_ups, text=f":warning: An unexpected error occurred while processing the Notion link <{url}>: ```{e}```")
                 else:
-                    logger.error(f"Notion API Error: {e}")
-                    say(channel=channel_id, thread_ts=thread_for_follow_ups, text=f":warning: An error occurred with the Notion API: ```{e}```")
-            except Exception as e:
-                logger.error(f"An unexpected error occurred while handling Notion link: {e}")
-                say(channel=channel_id, thread_ts=thread_for_follow_ups, text=f":warning: An unexpected error occurred while processing the Notion link: ```{e}```")
+                    logger.info(f"No page ID found for URL: {url}")
 
     except Exception as e:
         logger.error(f"Error during translation process: {e}")
