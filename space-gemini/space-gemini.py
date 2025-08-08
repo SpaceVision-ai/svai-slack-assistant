@@ -275,17 +275,18 @@ def handle_app_mention_events(body, say, client, logger):
                 logger.info("Flash model determined that context is needed.")
         except Exception as e:
             logger.error(f"Error with Flash model context check: {e}")
-            # Default to assuming context is needed if the check fails
-            needs_context = True 
+            needs_context = True # Default to assuming context is needed if the check fails
 
         extracted_context = ""
         context_payload = []
 
         if needs_context:
+            client.chat_update(channel=channel_id, ts=thinking_message["ts"], text="Checking previous context... 🧐")
             # Step 1 & 2: Extract context with Flash model
             extracted_context, context_payload, _ = extract_context_with_flash(client, channel_id, thread_ts, user_text)
 
         # Step 3: Process with Pro model
+        client.chat_update(channel=channel_id, ts=thinking_message["ts"], text="Generating response... 🤔")
         # Process files attached to the *current* message as well
         gemini_payload, extracted_texts = process_attachments(event)
         gemini_payload.extend(context_payload)
@@ -294,8 +295,8 @@ def handle_app_mention_events(body, say, client, logger):
         prompt_text = (
             f"You are a helpful AI assistant, Space Gemini. Please answer the user's question based on the provided context.\n"
             f"When you mention a user, you MUST use their Slack user ID in the format <@USER_ID>.\n"
-            f"--- Extracted Context from Conversation ---\n{extracted_context}\n\n"
-            f"--- User's Original Question ---\n{user_text}"
+            f"--- Extracted Context from Conversation ---{extracted_context}\n\n"
+            f"--- User's Original Question ---{user_text}"
         )
 
         full_prompt_text = "\n".join([prompt_text] + extracted_texts).strip()
@@ -312,6 +313,7 @@ def handle_app_mention_events(body, say, client, logger):
         logger.error(f"Error in app_mention handler: {e}")
         event = body.get("event", {})
         say(text=f"An error occurred: {e}", thread_ts=event.get("ts"), channel=event.get("channel"))
+
 
 
 
