@@ -254,7 +254,9 @@ def extract_context_with_flash(client, channel_id, thread_ts, user_prompt):
     structured_history = []
     for msg in messages:
         user_name = get_user_info(msg.get("user", "N/A"))
-        structured_history.append(f"(message_id='{msg.get('ts')}', author='{user_name}', message='''{msg.get("text", "")}'', has_files={bool(msg.get('files'))})")
+        has_files = bool(msg.get('files'))
+        message = msg.get("text", "")
+        structured_history.append(f"(message_id='{msg.get('ts')}', author='{user_name}', message='{message}', has_files={has_files})")
     
     history_string = "\n".join(structured_history)
 
@@ -273,7 +275,6 @@ def extract_context_with_flash(client, channel_id, thread_ts, user_prompt):
         
         flash_response = model_flash.generate_content(flash_prompt)
         relevant_message_ids = [ts.strip() for ts in flash_response.text.split(',') if ts.strip()]
-        logger.info(f"Flash model identified relevant message IDs: {relevant_message_ids}")
 
         final_text_parts = []
         final_payload_parts = []
@@ -294,7 +295,6 @@ def extract_context_with_flash(client, channel_id, thread_ts, user_prompt):
 
 @app.event("app_mention")
 def handle_app_mention_events(body, say, client, logger):
-    logger.info(body)
     try:
         event = body["event"]
         # Ignore messages from bots
@@ -334,12 +334,7 @@ def handle_app_mention_events(body, say, client, logger):
 
         prompt_text = (
             f"You are a helpful AI assistant, Space Gemini. Please answer the user's question based on the provided context.\n"
-            f"Your response will be displayed in Slack, so format it using Slack's `mrkdwn` style.\n"
-            f"- Use *asterisks* for bold text, not double asterisks.\n"
-            f"- Use `_italics_` for italics.\n"
-            f"- Use `~strikethrough~` for strikethrough.\n"
-            f"- For bulleted lists, start each item with a `*` or `-` followed by a space.\n"
-            f"- When you mention a user, you MUST use their Slack user ID in the format <@USER_ID>.\n"
+            f"When you mention a user, you MUST use their Slack user ID in the format <@USER_ID>.\n"
             f"--- Extracted Context from Conversation ---\n{extracted_context_text}\n\n"
             f"--- User's Original Question ---\n{current_message_text}"
         )
