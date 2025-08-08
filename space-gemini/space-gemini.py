@@ -12,6 +12,7 @@ import docx
 from PyPDF2 import PdfReader
 import re
 import notion_client
+from bs4 import BeautifulSoup
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -77,21 +78,15 @@ def extract_text_from_pdf(content):
 
 def get_page_id_from_url(url):
     """Extract Notion page ID from a URL."""
-    # Handle URLs with hyphens in the page ID at the end
     match = re.search(r'-([a-f0-9]{32})$', url.split('?')[0])
     if match:
         return match.group(1)
-    
-    # Handle URLs where the ID is the last part of the path
     match = re.search(r'/([a-f0-9]{32})$', url.split('?')[0])
     if match:
         return match.group(1)
-
-    # Handle standard Notion page URLs
     match = re.search(r'[a-f0-9]{32}', url)
     if match:
         return match.group(0)
-        
     return None
 
 def fetch_notion_page_content(page_id):
@@ -99,7 +94,7 @@ def fetch_notion_page_content(page_id):
     try:
         content = ""
         # Fetch blocks from the page
-        blocks = notion.blocks.children.list(block_id=page_id)[ "results"]
+        blocks = notion.blocks.children.list(block_id=page_id)("results")
         for block in blocks:
             if 'type' in block and block[block['type']].get('rich_text'):
                 for text_item in block[block['type']]['rich_text']:
@@ -110,18 +105,30 @@ def fetch_notion_page_content(page_id):
         logger.error(f"Error fetching Notion page content for page_id {page_id}: {e}")
         return None
 
-def find_last_notion_link_in_channel(client, channel_id):
-    """Finds the last Notion link in the channel's recent history."""
+def fetch_website_content(url):
+    """Fetches and returns the text content of a general website."""
     try:
-        history_response = client.conversations_history(channel=channel_id, limit=20) # Check last 20 messages
-        for message in history_response.get("messages", []):
-            text = message.get("text", "")
-            notion_urls = re.findall(r"https://www.notion.so/[\w\-./]+", text)
-            if notion_urls:
-                return notion_urls[0] # Return the first one found (which is the latest)
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+        }
+        response = requests.get(url, headers=headers, timeout=10)
+        response.raise_for_status()
+        soup = BeautifulSoup(response.content, 'html.parser')
+        # Remove script and style elements
+        for script_or_style in soup(["script", "style"]):
+            script_or_style.decompose()
+        # Get text
+        text = soup.get_text()
+        # Break into lines and remove leading/trailing space on each
+        lines = (line.strip() for line in text.splitlines())
+        # Break multi-headlines into a line each
+        chunks = (phrase.strip() for line in lines for phrase in line.split("  "))
+        # Drop blank lines
+        text = '\n'.join(chunk for chunk in chunks if chunk)
+        return text
     except Exception as e:
-        logger.error(f"Error searching for Notion link in channel {channel_id}: {e}")
-    return None
+        logger.error(f"Error fetching website content for {url}: {e}")
+        return f"[Warning: Could not fetch content from {url}]"
 
 def process_attachments(event):
     gemini_payload = []
@@ -141,8 +148,54 @@ def process_attachments(event):
                     logger.warning(f"Skipping unsupported file type: {mime_type}")
             except Exception as e:
                 logger.error(f"Error processing file {file_info.get('name')}: {e}")
-                # Optionally, notify the user about the error
     return gemini_payload, extracted_texts
+
+def process_message_for_context(message, client):
+    """Processes a single Slack message to extract text, file content, and link content."""
+    text_parts = []
+    payload_parts = []
+    message_text = message.get("text", "")
+
+    # 1. Add the base message text
+    if message_text:
+        text_parts.append(message_text)
+
+    # 2. Process attached files
+    if "files" in message:
+        payload, texts = process_attachments(message)
+        payload_parts.extend(payload)
+        text_parts.extend(texts)
+
+    # 3. Process all http/https links
+    urls = re.findall(r'<?(https?://[\w\-./?=&%#]+)>?', message_text)
+    for url in set(urls): # Use set to avoid processing duplicate URLs
+        if 'notion.so' in url or 'notion.site' in url:
+            page_id = get_page_id_from_url(url)
+            if page_id:
+                content = fetch_notion_page_content(page_id)
+                if content:
+                    text_parts.append(f"\n--- Content from Notion URL ({url}) ---\n{content}\n")
+        elif 'slack.com' in url:
+            match = re.search(r"archives/([A-Z0-9]+)/p(\d{16})", url)
+            if match:
+                channel_id, ts_digits = match.groups()
+                ts = f"{ts_digits[:10]}.{ts_digits[10:]}"
+                try:
+                    response = client.conversations_history(channel=channel_id, latest=ts, inclusive=True, limit=1)
+                    if response.get("messages"):
+                        linked_message = response["messages"][0]
+                        text, payload = process_message_for_context(linked_message, client)
+                        text_parts.append(f"\n--- Content from Slack link ({url}) ---\n{text}\n")
+                        payload_parts.extend(payload)
+                except Exception as e:
+                    logger.error(f"Failed to fetch Slack permalink content for {url}: {e}")
+                    text_parts.append(f"\n[Warning: Could not fetch content for Slack link {url}]\n")
+        else:
+            # General website
+            content = fetch_website_content(url)
+            text_parts.append(f"\n--- Content from Website ({url}) ---\n{content}\n")
+
+    return "\n".join(text_parts), payload_parts
 
 def handle_gemini_response(client, channel_id, thinking_message, text, thread_ts=None):
     SLACK_MSG_LIMIT = 4000
@@ -180,7 +233,7 @@ def handle_gemini_response(client, channel_id, thinking_message, text, thread_ts
         client.chat_postMessage(text=f"An error occurred: {e}", thread_ts=thread_ts, channel=channel_id)
 
 def extract_context_with_flash(client, channel_id, thread_ts, user_prompt):
-    """Gathers conversation history, asks Flash model to extract relevant context, and processes it."""
+    """Gathers conversation history, asks Flash model to identify relevant messages, and processes them."""
     messages = []
     if thread_ts:
         try:
@@ -196,28 +249,20 @@ def extract_context_with_flash(client, channel_id, thread_ts, user_prompt):
             logger.error(f"Error fetching channel history for context extraction: {e}")
 
     if not messages:
-        return "", [], []
+        return "", []
 
-    # Create the structured conversation history
     structured_history = []
     for msg in messages:
-        user_id = msg.get("user", "N/A")
-        user_name = get_user_info(user_id) if user_id != "N/A" else "Bot/App"
-        message_text = msg.get("text", "")
-        message_ts = msg.get("ts", "")
-        files = msg.get("files", [])
-        file_info = [(f.get("id"), f.get("name")) for f in files]
-        structured_history.append(f"(message_id='{message_ts}', author='{user_name}(<@{user_id}>)', message='''{message_text}''', files={file_info})")
+        user_name = get_user_info(msg.get("user", "N/A"))
+        structured_history.append(f"(message_id='{msg.get('ts')}', author='{user_name}', message='''{msg.get("text", "")}'', has_files={bool(msg.get('files'))})")
     
     history_string = "\n".join(structured_history)
 
-    # Ask Flash model to extract the necessary context
     try:
-        flash_prompt = f"""You are a context analysis expert. From the 'Previous Slack Conversation' below, extract all message texts and file information (IDs and names) that are necessary to answer the 'User Prompt'.
+        flash_prompt = f"""You are a context analysis expert. From the 'Previous Slack Conversation' below, identify which message_ids are relevant to answer the 'User Prompt'.
 
-        - Respond with only the extracted text and file details, or with an empty response if no context is needed.
-        - Combine all text into a single block.
-        - List all relevant file IDs and names in a structured format under a 'Files:' heading.
+        - Respond with only a comma-separated list of the necessary message_ids (e.g., '1629888000.000100,1629888001.000200').
+        - If no context is needed, respond with an empty string.
 
         [Previous Slack Conversation]
         {history_string}
@@ -227,29 +272,23 @@ def extract_context_with_flash(client, channel_id, thread_ts, user_prompt):
         """
         
         flash_response = model_flash.generate_content(flash_prompt)
-        extracted_context_text = flash_response.text
-        logger.info(f"Flash model extracted context:\n{extracted_context_text}")
+        relevant_message_ids = [ts.strip() for ts in flash_response.text.split(',') if ts.strip()]
+        logger.info(f"Flash model identified relevant message IDs: {relevant_message_ids}")
 
-        # Process the files mentioned in the flash response
-        gemini_payload = []
-        if "Files:" in extracted_context_text:
-            # Extract file IDs from the text
-            file_ids_to_fetch = re.findall(r"(\\w+),", extracted_context_text)
-            if file_ids_to_fetch:
-                all_files_in_history = [file for msg in messages if "files" in msg for file in msg["files"]]
-                files_to_process = [f for f in all_files_in_history if f.get("id") in file_ids_to_fetch]
-                
-                if files_to_process:
-                    dummy_event = {"files": files_to_process}
-                    # Note: process_attachments returns (payload, text_list), we only need the payload here
-                    # The text from docx/txt will be in the extracted_context_text already
-                    gemini_payload, _ = process_attachments(dummy_event)
+        final_text_parts = []
+        final_payload_parts = []
+        relevant_messages = [msg for msg in messages if msg.get("ts") in relevant_message_ids]
+        
+        for msg in relevant_messages:
+            text, payload = process_message_for_context(msg, client)
+            final_text_parts.append(text)
+            final_payload_parts.extend(payload)
 
-        return extracted_context_text, gemini_payload, [] # Return empty list for extracted_texts for now
+        return "\n".join(final_text_parts), final_payload_parts
 
     except Exception as e:
         logger.error(f"Error during Flash model context extraction: {e}")
-        return "", [], [] # Return empty on error
+        return "", []
 
 # --- Slack Event Handlers ---
 
@@ -265,44 +304,40 @@ def handle_app_mention_events(body, say, client, logger):
 
         thinking_message = say(text="Thinking...", thread_ts=thread_ts or message_ts, channel=channel_id)
 
-        # Step 0: Check if context is needed
         needs_context = False
         try:
-            check_prompt = f"Does the following user request require you to look at previous messages, threads, or files in the conversation for context? Answer with only 'True' or 'False'. Request: \"{user_text}\""
+            check_prompt = f'''Does the following user request require you to look at previous messages, threads, or files in the conversation for context? Answer with only 'True' or 'False'. Request: "{user_text}"'''
             response = model_flash.generate_content(check_prompt)
             if "true" in response.text.lower():
                 needs_context = True
                 logger.info("Flash model determined that context is needed.")
         except Exception as e:
             logger.error(f"Error with Flash model context check: {e}")
-            needs_context = True # Default to assuming context is needed if the check fails
+            needs_context = True
 
-        extracted_context = ""
+        extracted_context_text = ""
         context_payload = []
 
         if needs_context:
             client.chat_update(channel=channel_id, ts=thinking_message["ts"], text="Checking previous context... 🧐")
-            # Step 1 & 2: Extract context with Flash model
-            extracted_context, context_payload, _ = extract_context_with_flash(client, channel_id, thread_ts, user_text)
+            extracted_context_text, context_payload = extract_context_with_flash(client, channel_id, thread_ts, user_text)
 
-        # Step 3: Process with Pro model
         client.chat_update(channel=channel_id, ts=thinking_message["ts"], text="Generating response... 🤔")
-        # Process files attached to the *current* message as well
-        gemini_payload, extracted_texts = process_attachments(event)
-        gemini_payload.extend(context_payload)
+        
+        current_message_text, current_payload = process_message_for_context(event, client)
+        
+        gemini_payload = context_payload + current_payload
 
-        # Construct the final prompt for the Pro model
         prompt_text = (
             f"You are a helpful AI assistant, Space Gemini. Please answer the user's question based on the provided context.\n"
             f"When you mention a user, you MUST use their Slack user ID in the format <@USER_ID>.\n"
-            f"--- Extracted Context from Conversation ---{extracted_context}\n\n"
-            f"--- User's Original Question ---{user_text}"
+            f"--- Extracted Context from Conversation ---\n{extracted_context_text}\n\n"
+            f"--- User's Original Question ---\n{current_message_text}"
         )
 
-        full_prompt_text = "\n".join([prompt_text] + extracted_texts).strip()
-        gemini_payload.insert(0, full_prompt_text)
+        gemini_payload.insert(0, prompt_text)
 
-        if not full_prompt_text and not gemini_payload:
+        if not user_text and not gemini_payload:
              client.chat_update(channel=channel_id, ts=thinking_message["ts"], text="I need a question or some text to go with the files.")
              return
 
@@ -313,16 +348,6 @@ def handle_app_mention_events(body, say, client, logger):
         logger.error(f"Error in app_mention handler: {e}")
         event = body.get("event", {})
         say(text=f"An error occurred: {e}", thread_ts=event.get("ts"), channel=event.get("channel"))
-
-
-
-
-
-    except Exception as e:
-        logger.error(f"Error in app_mention handler: {e}")
-        event = body.get("event", {})
-        say(text=f"An error occurred: {e}", thread_ts=event.get("ts"), channel=event.get("channel"))
-
 
 @app.event("message")
 def handle_direct_messages(body, say, client, logger):
