@@ -297,6 +297,10 @@ def handle_app_mention_events(body, say, client, logger):
     logger.info(body)
     try:
         event = body["event"]
+        # Ignore messages from bots
+        if event.get("bot_id"):
+            return
+            
         user_text = event.get("text", "").strip()
         channel_id = event["channel"]
         message_ts = event.get("ts")
@@ -330,7 +334,12 @@ def handle_app_mention_events(body, say, client, logger):
 
         prompt_text = (
             f"You are a helpful AI assistant, Space Gemini. Please answer the user's question based on the provided context.\n"
-            f"When you mention a user, you MUST use their Slack user ID in the format <@USER_ID>.\n"
+            f"Your response will be displayed in Slack, so format it using Slack's `mrkdwn` style.\n"
+            f"- Use *asterisks* for bold text, not double asterisks.\n"
+            f"- Use `_italics_` for italics.\n"
+            f"- Use `~strikethrough~` for strikethrough.\n"
+            f"- For bulleted lists, start each item with a `*` or `-` followed by a space.\n"
+            f"- When you mention a user, you MUST use their Slack user ID in the format <@USER_ID>.\n"
             f"--- Extracted Context from Conversation ---\n{extracted_context_text}\n\n"
             f"--- User's Original Question ---\n{current_message_text}"
         )
