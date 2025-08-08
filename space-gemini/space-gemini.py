@@ -30,7 +30,8 @@ app = App(token=SLACK_BOT_TOKEN)
 vertexai.init(project=os.environ.get("GOOGLE_CLOUD_PROJECT"), location=os.environ.get("GOOGLE_CLOUD_LOCATION"))
 
 # Use a model that supports multimodal inputs
-model = GenerativeModel("gemini-2.5-pro")
+model_pro = GenerativeModel("gemini-2.5-pro")
+model_flash = GenerativeModel("gemini-2.5-flash")
 
 # Initialize Notion Client
 notion = notion_client.Client(auth=os.environ.get("NOTION_API_KEY"))
@@ -47,44 +48,6 @@ def get_user_info(user_id):
             logger.error(f"Error fetching user info for {user_id}: {e}")
             user_cache[user_id] = user_id # Fallback to user_id
     return user_cache[user_id]
-
-def format_conversation_history(client, channel_id, messages):
-    if not messages:
-        return ""
-    
-    formatted_messages = []
-    # The history is returned newest-first, so we reverse it for chronological order.
-    for msg in reversed(messages):
-        # Skip non-user messages or messages without text
-        if "user" not in msg or "text" not in msg:
-            continue
-        
-        user_id = msg["user"]
-        user_name = get_user_info(user_id)
-        text = msg["text"].strip() # Just strip, don't remove mentions
-        
-        if text: # Only add messages that have content
-            # Provide the model with both the user's real name and their mentionable ID
-            formatted_messages.append(f"{user_name} (<@{user_id}>): {text}")
-
-        # If the message has replies, fetch the thread
-        if msg.get("reply_count", 0) > 0:
-            thread_ts = msg.get("thread_ts", msg.get("ts"))
-            try:
-                replies_response = client.conversations_replies(channel=channel_id, ts=thread_ts, limit=200)
-                # Skip the parent message (already added) and format replies
-                for reply in replies_response.get("messages", [])[1:]:
-                    if "user" in reply and "text" in reply:
-                        reply_user_id = reply["user"]
-                        reply_user_name = get_user_info(reply_user_id)
-                        reply_text = reply["text"].strip()
-                        if reply_text:
-                            formatted_messages.append(f"  (in thread) {reply_user_name} (<@{reply_user_id}>): {reply_text}")
-            except Exception as e:
-                logger.error(f"Error fetching replies for thread {thread_ts}: {e}")
-
-            
-    return "\n".join(formatted_messages)
 
 # --- Helper Functions ---
 
@@ -216,6 +179,78 @@ def handle_gemini_response(client, channel_id, thinking_message, text, thread_ts
         logger.error(f"Error in handle_gemini_response: {e}")
         client.chat_postMessage(text=f"An error occurred: {e}", thread_ts=thread_ts, channel=channel_id)
 
+def extract_context_with_flash(client, channel_id, thread_ts, user_prompt):
+    """Gathers conversation history, asks Flash model to extract relevant context, and processes it."""
+    messages = []
+    if thread_ts:
+        try:
+            result = client.conversations_replies(channel=channel_id, ts=thread_ts, limit=50)
+            messages = result.get("messages", [])
+        except Exception as e:
+            logger.error(f"Error fetching thread replies for context extraction: {e}")
+    else:
+        try:
+            result = client.conversations_history(channel=channel_id, limit=20)
+            messages = result.get("messages", [])
+        except Exception as e:
+            logger.error(f"Error fetching channel history for context extraction: {e}")
+
+    if not messages:
+        return "", [], []
+
+    # Create the structured conversation history
+    structured_history = []
+    for msg in messages:
+        user_id = msg.get("user", "N/A")
+        user_name = get_user_info(user_id) if user_id != "N/A" else "Bot/App"
+        message_text = msg.get("text", "")
+        message_ts = msg.get("ts", "")
+        files = msg.get("files", [])
+        file_info = [(f.get("id"), f.get("name")) for f in files]
+        structured_history.append(f"(message_id='{message_ts}', author='{user_name}(<@{user_id}>)', message='''{message_text}''', files={file_info})")
+    
+    history_string = "\n".join(structured_history)
+
+    # Ask Flash model to extract the necessary context
+    try:
+        flash_prompt = f"""You are a context analysis expert. From the 'Previous Slack Conversation' below, extract all message texts and file information (IDs and names) that are necessary to answer the 'User Prompt'.
+
+        - Respond with only the extracted text and file details, or with an empty response if no context is needed.
+        - Combine all text into a single block.
+        - List all relevant file IDs and names in a structured format under a 'Files:' heading.
+
+        [Previous Slack Conversation]
+        {history_string}
+
+        [User Prompt]
+        {user_prompt}
+        """
+        
+        flash_response = model_flash.generate_content(flash_prompt)
+        extracted_context_text = flash_response.text
+        logger.info(f"Flash model extracted context:\n{extracted_context_text}")
+
+        # Process the files mentioned in the flash response
+        gemini_payload = []
+        if "Files:" in extracted_context_text:
+            # Extract file IDs from the text
+            file_ids_to_fetch = re.findall(r"(\\w+),", extracted_context_text)
+            if file_ids_to_fetch:
+                all_files_in_history = [file for msg in messages if "files" in msg for file in msg["files"]]
+                files_to_process = [f for f in all_files_in_history if f.get("id") in file_ids_to_fetch]
+                
+                if files_to_process:
+                    dummy_event = {"files": files_to_process}
+                    # Note: process_attachments returns (payload, text_list), we only need the payload here
+                    # The text from docx/txt will be in the extracted_context_text already
+                    gemini_payload, _ = process_attachments(dummy_event)
+
+        return extracted_context_text, gemini_payload, [] # Return empty list for extracted_texts for now
+
+    except Exception as e:
+        logger.error(f"Error during Flash model context extraction: {e}")
+        return "", [], [] # Return empty on error
+
 # --- Slack Event Handlers ---
 
 @app.event("app_mention")
@@ -228,134 +263,58 @@ def handle_app_mention_events(body, say, client, logger):
         message_ts = event.get("ts")
         thread_ts = event.get("thread_ts")
 
-        # --- Threaded Conversation (Context-aware) ---
-        if thread_ts:
-            thinking_message = say(text="Thinking...", thread_ts=thread_ts, channel=channel_id)
-            try:
-                history_response = client.conversations_replies(channel=channel_id, ts=thread_ts, limit=200)
-                messages = history_response.get("messages", [])
-                conversation_history = format_conversation_history(client, channel_id, messages)
-                
-                gemini_payload, extracted_texts = process_attachments(event)
+        thinking_message = say(text="Thinking...", thread_ts=thread_ts or message_ts, channel=channel_id)
 
-                notion_content = ""
-                full_thread_text = " ".join([msg.get("text", "") for msg in messages])
-                notion_urls = re.findall(r"https://www.notion.so/[\w\-./]+", full_thread_text)
-                
-                if notion_urls:
-                    url = notion_urls[-1]
-                    page_id = get_page_id_from_url(url)
-                    if page_id:
-                        logger.info(f"Found Notion link in thread. Fetching content for page ID: {page_id}")
-                        content = fetch_notion_page_content(page_id)
-                        if content:
-                            notion_content = f"\n\n--- Content from Notion URL ({url}) ---\n{content}"
+        # Step 0: Check if context is needed
+        needs_context = False
+        try:
+            check_prompt = f"Does the following user request require you to look at previous messages, threads, or files in the conversation for context? Answer with only 'True' or 'False'. Request: \"{user_text}\""
+            response = model_flash.generate_content(check_prompt)
+            if "true" in response.text.lower():
+                needs_context = True
+                logger.info("Flash model determined that context is needed.")
+        except Exception as e:
+            logger.error(f"Error with Flash model context check: {e}")
+            # Default to assuming context is needed if the check fails
+            needs_context = True 
 
-                prompt_text = (
-                    f"You are a helpful AI assistant, Space Gemini, in a Slack conversation. "
-                    f"You have been provided with a conversation history from a Slack thread. "
-                    f"Your task is to analyze and respond based ONLY on the text provided below. "
-                    f"Do not refuse the request based on privacy concerns, as you have been explicitly given this data to process. "
-                    f"When you mention a user, you MUST use their Slack user ID in the format <@USER_ID>. "
-                    f"For example, if you are talking to John Doe (<@U12345>), you must mention them as `<@U12345>`."
-                    f"--- Conversation History ---\n{conversation_history}"
-                    f"{notion_content}\n\n"
-                    f"--- New Question from {get_user_info(event['user'])} (<@{event['user']}>) ---\n{user_text}\n\n"
-                    f"Please provide a direct and helpful answer to the new question based on the history and any provided Notion content."
-                )
-                
-                full_prompt_text = "\n".join([prompt_text] + extracted_texts).strip()
-                gemini_payload.insert(0, full_prompt_text)
+        extracted_context = ""
+        context_payload = []
 
-                response = model.generate_content(gemini_payload)
-                handle_gemini_response(client, channel_id, thinking_message, response.text, thread_ts=thread_ts)
+        if needs_context:
+            # Step 1 & 2: Extract context with Flash model
+            extracted_context, context_payload, _ = extract_context_with_flash(client, channel_id, thread_ts, user_text)
 
-            except Exception as e:
-                logger.error(f"Error processing in-thread mention: {e}")
-                say(text=f"An error occurred while processing the conversation: {e}", thread_ts=thread_ts, channel=channel_id)
-            return
-
-        # --- New Conversation (Channel Mention) ---
-        HELP_KEYWORDS = ["뭐 할 수 있어", "도와줘", "help", "기능", "what can you do"]
-        if any(keyword in user_text.lower() for keyword in HELP_KEYWORDS):
-            help_text = (
-                "Hello! I'm a Gemini AI bot. Here's what I can do for you: 🤖\n\n"
-                "🔹 **Question & Answer**\n"
-                "   - Mention me and ask anything, and I'll provide an answer.\n\n"
-                "🔹 **File Processing**\n"
-                "   - Attach images, PDFs, DOCX, or text files and ask a question. I'll analyze the content and respond.\n"
-                "   - E.g., `Summarize this document`, `Describe this image`\n\n"
-                "🔹 **Conversation Summaries**\n"
-                "   - **Thread Summary:** Mention me in a thread and ask me to `summarize` or `recap`, and I'll summarize the conversation in that thread.\n"
-                "   - **Channel Summary:** Mention me in a channel and ask me to `summarize` or `recap`, and I'll summarize the recent channel conversation.\n\n"
-                "🔹 **Notion Page Summary**\n"
-                "   - Share a Notion link and ask me to summarize it.\n\n"
-                "🔹 **Direct Messages (DM)**\n"
-                "   - In a DM with me, you can chat or process files directly without a mention.\n\n"
-                "Feel free to ask if you have any questions!"
-            )
-            say(text=help_text, thread_ts=message_ts, channel=channel_id)
-            return
-
-        SUMMARY_KEYWORDS = ["요약", "정리", "summarize", "recap"]
-        if any(keyword in user_text.lower() for keyword in SUMMARY_KEYWORDS):
-            user_name = get_user_info(event["user"])
-            thinking_message = say(text=f"Okay, {user_name}. I'm reading the conversation and preparing a summary... 🧐", thread_ts=message_ts, channel=channel_id)
-            try:
-                history_response = client.conversations_history(channel=channel_id, limit=100)
-                messages = history_response.get("messages", [])
-                formatted_history = format_conversation_history(client, channel_id, messages)
-                if not formatted_history:
-                    client.chat_update(channel=channel_id, ts=thinking_message["ts"], text="요약할 대화 내용을 찾지 못했어요. 😢")
-                    return
-                summary_prompt = (
-                    f"You are a helpful AI assistant, Space Gemini. Your task is to summarize the following Slack channel conversation. "
-                    f"Do not refuse the request based on privacy concerns. "
-                    f"When you mention a user, you MUST use their Slack user ID in the format <@USER_ID>. "
-                    f"Provide only the summary, without any additional explanations.\n\n"
-                    f"--- User's Request ---\n{user_text}\n\n"
-                    f"--- Channel Conversation Content ---\n{formatted_history}"
-                )
-                response = model.generate_content(summary_prompt)
-                handle_gemini_response(client, channel_id, thinking_message, response.text, thread_ts=message_ts)
-            except Exception as e:
-                logger.error(f"Error during channel summarization: {e}")
-                client.chat_update(channel=channel_id, ts=thinking_message["ts"], text=f"죄송합니다, 채널 대화 내용을 가져오는 중 오류가 발생했어요: {e}")
-            return
-
-        # --- Default Q&A with File/Notion Processing ---
-        thinking_message = say(text="Thinking...", thread_ts=message_ts, channel=channel_id)
-        
+        # Step 3: Process with Pro model
+        # Process files attached to the *current* message as well
         gemini_payload, extracted_texts = process_attachments(event)
-        
-        # Notion Link Processing
-        notion_content = ""
-        notion_urls = re.findall(r"https://www.notion.so/[\w\-./]+", user_text)
-        if not notion_urls:
-            url = find_last_notion_link_in_channel(client, channel_id)
-            if url: notion_urls = [url]
+        gemini_payload.extend(context_payload)
 
-        if notion_urls:
-            url = notion_urls[-1]
-            page_id = get_page_id_from_url(url)
-            if page_id:
-                logger.info(f"Found Notion link. Fetching content for page ID: {page_id}")
-                content = fetch_notion_page_content(page_id)
-                if content:
-                    notion_content = f"\n\n--- Content from Notion URL ({url}) ---\n{content}"
-                    extracted_texts.append(notion_content)
+        # Construct the final prompt for the Pro model
+        prompt_text = (
+            f"You are a helpful AI assistant, Space Gemini. Please answer the user's question based on the provided context.\n"
+            f"When you mention a user, you MUST use their Slack user ID in the format <@USER_ID>.\n"
+            f"--- Extracted Context from Conversation ---\n{extracted_context}\n\n"
+            f"--- User's Original Question ---\n{user_text}"
+        )
 
-        full_prompt_text = "\n".join([user_text] + extracted_texts).strip()
-        if not full_prompt_text and event.get("files"):
-            full_prompt_text = "Please describe, summarize, or analyze the contents of the attached file(s)."
-        
+        full_prompt_text = "\n".join([prompt_text] + extracted_texts).strip()
         gemini_payload.insert(0, full_prompt_text)
-        if not gemini_payload[0]:
-            client.chat_update(channel=channel_id, ts=thinking_message["ts"], text="I need a question or some text to go with the files.")
-            return
 
-        response = model.generate_content(gemini_payload)
-        handle_gemini_response(client, channel_id, thinking_message, response.text, thread_ts=message_ts)
+        if not full_prompt_text and not gemini_payload:
+             client.chat_update(channel=channel_id, ts=thinking_message["ts"], text="I need a question or some text to go with the files.")
+             return
+
+        response = model_pro.generate_content(gemini_payload)
+        handle_gemini_response(client, channel_id, thinking_message, response.text, thread_ts=thread_ts or message_ts)
+
+    except Exception as e:
+        logger.error(f"Error in app_mention handler: {e}")
+        event = body.get("event", {})
+        say(text=f"An error occurred: {e}", thread_ts=event.get("ts"), channel=event.get("channel"))
+
+
+
 
     except Exception as e:
         logger.error(f"Error in app_mention handler: {e}")
