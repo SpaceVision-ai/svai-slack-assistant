@@ -116,11 +116,46 @@ def handle_member_joined_channel(event, say, logger):
 
 def should_translate(event):
     """Determine if a message should be translated."""
-    if not event.get('text'):
+    text = event.get('text', '')
+    if not text:
         return False
-    channel_id = event.get('channel')
-    channel_type = event.get('channel_type')
-    return channel_manager.is_channel_registered(channel_id) or channel_type in ['im', 'mpim']
+
+    # 1. Define patterns for special elements
+    bracketed_url_pattern = r"<https?://[^>]+>"
+    plain_url_pattern = r"https?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\(\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+"
+    mention_pattern = r"<@\w+>"
+
+    # 2. Check for the presence of normal text
+    text_without_special_elements = re.sub(bracketed_url_pattern, '', text)
+    text_without_special_elements = re.sub(plain_url_pattern, '', text_without_special_elements)
+    text_without_special_elements = re.sub(mention_pattern, '', text_without_special_elements)
+
+    # If there is any plain text, proceed with translation
+    if text_without_special_elements.strip():
+        channel_id = event.get('channel')
+        channel_type = event.get('channel_type')
+        return channel_manager.is_channel_registered(channel_id) or channel_type in ['im', 'mpim']
+
+    # 3. If no plain text, check if any of the URLs are from Notion or Slack
+    all_urls_found = re.findall(bracketed_url_pattern, text) + re.findall(plain_url_pattern, text)
+    
+    has_special_link = False
+    for url in all_urls_found:
+        # Extract the actual URL from formats like <url|text>
+        clean_url = url.strip('<>').split('|')[0]
+        if 'notion.so' in clean_url or 'notion.site' in clean_url or 'slack.com' in clean_url:
+            has_special_link = True
+            break
+    
+    # If a special link is found, proceed with translation
+    if has_special_link:
+        channel_id = event.get('channel')
+        channel_type = event.get('channel_type')
+        return channel_manager.is_channel_registered(channel_id) or channel_type in ['im', 'mpim']
+
+    # Otherwise, do not translate
+    return False
+
 
 def get_page_id_from_url(url):
     """Extract Notion page ID from a URL."""
