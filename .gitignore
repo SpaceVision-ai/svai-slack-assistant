@@ -152,3 +152,6 @@ translate-gem/registered_channels.json
 
 # VS Code settings
 .vscode/
+
+# Database files
+processed_news.db

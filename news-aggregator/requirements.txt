@@ -1,0 +1,4 @@
+feedparser
+google-cloud-aiplatform
+python-dotenv
+pyyaml
