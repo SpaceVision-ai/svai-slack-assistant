@@ -3,6 +3,7 @@ import logging
 import time
 import requests
 import io
+import json
 from dotenv import load_dotenv
 from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
@@ -11,6 +12,7 @@ from vertexai.generative_models import GenerativeModel, Part
 import docx
 from PyPDF2 import PdfReader
 import re
+from datetime import datetime, timedelta
 import notion_client
 from bs4 import BeautifulSoup
 
@@ -37,6 +39,10 @@ model_flash = GenerativeModel("gemini-2.5-flash")
 # Initialize Notion Client
 notion = notion_client.Client(auth=os.environ.get("NOTION_API_KEY"))
 
+# --- Constants ---
+CHANNEL_HISTORY_LIMIT = 50 # Number of recent messages to check in a channel
+DEFAULT_CONTEXT_DAYS = 3 # Default number of days to look back for context
+
 # --- User Info Cache ---
 user_cache = {}
 
@@ -44,10 +50,17 @@ def get_user_info(user_id):
     if user_id not in user_cache:
         try:
             response = app.client.users_info(user=user_id)
-            user_cache[user_id] = response["user"]["real_name"] or response["user"]["name"]
+            user_info = response["user"]
+            user_cache[user_id] = {
+                "name": user_info.get("real_name") or user_info.get("name"),
+                "tz": user_info.get("tz")
+            }
         except Exception as e:
             logger.error(f"Error fetching user info for {user_id}: {e}")
-            user_cache[user_id] = user_id # Fallback to user_id
+            user_cache[user_id] = {
+                "name": user_id,
+                "tz": None
+            } # Fallback
     return user_cache[user_id]
 
 # --- Helper Functions ---
@@ -76,12 +89,29 @@ def extract_text_from_pdf(content):
         logger.error(f"Error extracting text from PDF: {e}")
         return ""
 
+def get_start_time_from_period(period_str):
+    now = datetime.now()
+    if period_str == "today":
+        return now.replace(hour=0, minute=0, second=0, microsecond=0)
+    if period_str == "yesterday":
+        return (now - timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+    if period_str == "this_week":
+        start_of_week = now - timedelta(days=now.weekday())
+        return start_of_week.replace(hour=0, minute=0, second=0, microsecond=0)
+    if "_days" in period_str:
+        try:
+            days = int(period_str.split('_')[0])
+            return (now - timedelta(days=days-1)).replace(hour=0, minute=0, second=0, microsecond=0)
+        except:
+            return None
+    return None
+
 def get_page_id_from_url(url):
     """Extract Notion page ID from a URL."""
-    match = re.search(r'-([a-f0-9]{32})$', url.split('?')[0])
+    match = re.search(r'-([a-f0-9]{32})', url.split('?')[0])
     if match:
         return match.group(1)
-    match = re.search(r'/([a-f0-9]{32})$', url.split('?')[0])
+    match = re.search(r'/([a-f0-9]{32}/)', url.split('?')[0])
     if match:
         return match.group(1)
     match = re.search(r'[a-f0-9]{32}', url)
@@ -90,20 +120,46 @@ def get_page_id_from_url(url):
     return None
 
 def fetch_notion_page_content(page_id):
-    """Fetches and returns the text content of a Notion page."""
+    """
+    Fetches and returns the text content of a Notion page, including nested blocks.
+    """
     try:
-        content = ""
-        # Fetch blocks from the page
-        blocks = notion.blocks.children.list(block_id=page_id)("results")
+        all_text = []
+        # Start the recursive fetch from the page ID
+        _fetch_blocks_recursively(page_id, all_text, 0)
+        return "\n".join(all_text)
+    except Exception as e:
+        logger.error(f"Error starting Notion page fetch for page_id {page_id}: {e}")
+        return None
+
+def _fetch_blocks_recursively(block_id, text_list, indent_level):
+    """
+    A recursive helper function to fetch all blocks and their children from Notion.
+    """
+    try:
+        response = notion.blocks.children.list(block_id=block_id)
+        blocks = response.get("results", [])
+        
         for block in blocks:
+            # Extract text from the current block
+            block_text = ""
             if 'type' in block and block[block['type']].get('rich_text'):
                 for text_item in block[block['type']]['rich_text']:
                     if text_item.get('plain_text'):
-                        content += text_item['plain_text'] + '\n'
-        return content
+                        block_text += text_item['plain_text']
+            
+            if block_text:
+                indent = "  " * indent_level
+                text_list.append(f"{indent}- {block_text}")
+
+            # If the block has children, recurse to fetch nested content
+            if block.get("has_children"):
+                _fetch_blocks_recursively(block["id"], text_list, indent_level + 1)
+                
     except Exception as e:
-        logger.error(f"Error fetching Notion page content for page_id {page_id}: {e}")
-        return None
+        # Log the error for the specific block and continue with others
+        logger.error(f"Error fetching children for Notion block {block_id}: {e}")
+
 
 def fetch_website_content(url):
     """Fetches and returns the text content of a general website."""
@@ -232,64 +288,120 @@ def handle_gemini_response(client, channel_id, thinking_message, text, thread_ts
         logger.error(f"Error in handle_gemini_response: {e}")
         client.chat_postMessage(text=f"An error occurred: {e}", thread_ts=thread_ts, channel=channel_id)
 
-def extract_context_with_flash(client, channel_id, thread_ts, user_prompt):
-    """Gathers conversation history, asks Flash model to identify relevant messages, and processes them."""
+def extract_context_with_flash(client, channel_id, thread_ts, user_prompt, start_time=None):
+    """
+    Gathers conversation history, asks Flash model to identify relevant messages,
+    and processes them into a structured list. This includes content from attachments and links.
+    """
     messages = []
     if thread_ts:
         try:
-            result = client.conversations_replies(channel=channel_id, ts=thread_ts, limit=50)
+            # Fetch thread replies, limit increased to 100 for better context
+            result = client.conversations_replies(channel=channel_id, ts=thread_ts, limit=100)
             messages = result.get("messages", [])
+
+            # Ensure the parent message is included
+            parent_message_ts = thread_ts
+            if not any(msg.get('ts') == parent_message_ts for msg in messages):
+                logger.info(f"Parent message {parent_message_ts} not in recent replies, fetching it explicitly.")
+                parent_message_response = client.conversations_history(
+                    channel=channel_id, latest=parent_message_ts, inclusive=True, limit=1
+                )
+                if parent_message_response.get("messages"):
+                    messages.insert(0, parent_message_response["messages"][0])
         except Exception as e:
             logger.error(f"Error fetching thread replies for context extraction: {e}")
-    else:
+    else: # Main channel mention
         try:
-            result = client.conversations_history(channel=channel_id, limit=20)
-            messages = result.get("messages", [])
+            # 1. Fetch recent messages using start_time or the default limit
+            if start_time:
+                logger.info(f"Fetching channel history since {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
+                history_result = client.conversations_history(
+                    channel=channel_id,
+                    oldest=str(start_time.timestamp()),
+                    limit=1000  # Use a larger limit for specific time ranges
+                )
+            else:
+                history_result = client.conversations_history(channel=channel_id, limit=CHANNEL_HISTORY_LIMIT)
+            
+            top_level_messages = history_result.get("messages", [])
+            
+            all_messages = []
+            processed_thread_ts = set()
+
+            for msg in top_level_messages:
+                all_messages.append(msg)
+
+                # 2. If a message has a thread, fetch its replies
+                thread_ts_val = msg.get("thread_ts")
+                if thread_ts_val and thread_ts_val not in processed_thread_ts:
+                    processed_thread_ts.add(thread_ts_val)
+                    logger.info(f"Found thread {thread_ts_val} in channel history, fetching its replies.")
+                    try:
+                        replies_result = client.conversations_replies(channel=channel_id, ts=thread_ts_val)
+                        thread_messages = replies_result.get("messages", [])
+                        all_messages.extend(thread_messages)
+                    except Exception as e:
+                        logger.error(f"Error fetching replies for thread {thread_ts_val}: {e}")
+            
+            # De-duplicate messages using their timestamp
+            unique_messages_dict = {msg['ts']: msg for msg in all_messages}
+            messages = list(unique_messages_dict.values())
+            messages.sort(key=lambda x: float(x['ts']), reverse=True) # Sort by timestamp descending
+
         except Exception as e:
-            logger.error(f"Error fetching channel history for context extraction: {e}")
+            logger.error(f"Error fetching channel history and threads: {e}")
 
     if not messages:
-        return "", []
+        return []
 
+    # Create a simplified history for the Flash model to select relevant messages
     structured_history = []
     for msg in messages:
         user_name = get_user_info(msg.get("user", "N/A"))
-        has_files = bool(msg.get('files'))
-        message = msg.get("text", "")
-        structured_history.append(f"(message_id='{msg.get('ts')}', author='{user_name}', message='{message}', has_files={has_files})")
+        has_files = "has attachments or links" if msg.get('files') or 'http' in msg.get('text', '') else ""
+        message_preview = msg.get("text", "")[:150] # Preview of message
+        structured_history.append(f"(message_id='{msg.get('ts')}', author='{user_name}', message='{message_preview}...', info='{has_files}')")
     
     history_string = "\n".join(structured_history)
 
     try:
-        flash_prompt = f"""You are a context analysis expert. From the 'Previous Slack Conversation' below, identify which message_ids are relevant to answer the 'User Prompt'.
+        # Ask Flash to select relevant message IDs
+        flash_prompt = f"""You are a context analysis expert. From the 'Previous Slack Conversation' below, identify which message_ids are essential for answering the 'User Prompt'. Consider messages with key info, questions, decisions, and attachments. Respond with only a comma-separated list of the necessary message_ids (e.g., '1629888000.000100,1629888001.000200'). If no context is needed, respond with an empty string.
 
-        - Respond with only a comma-separated list of the necessary message_ids (e.g., '1629888000.000100,1629888001.000200').
-        - If no context is needed, respond with an empty string.
+[Previous Slack Conversation]
+{history_string}
 
-        [Previous Slack Conversation]
-        {history_string}
-
-        [User Prompt]
-        {user_prompt}
-        """
-        
+[User Prompt]
+{user_prompt}
+"""
         flash_response = model_flash.generate_content(flash_prompt)
-        relevant_message_ids = [ts.strip() for ts in flash_response.text.split(',') if ts.strip()]
+        relevant_message_ids = {ts.strip() for ts in flash_response.text.split(',') if ts.strip()}
 
-        final_text_parts = []
-        final_payload_parts = []
+        if not relevant_message_ids:
+            return []
+
+        # Process only the selected messages into a structured format
+        final_structured_context = []
         relevant_messages = [msg for msg in messages if msg.get("ts") in relevant_message_ids]
         
         for msg in relevant_messages:
             text, payload = process_message_for_context(msg, client)
-            final_text_parts.append(text)
-            final_payload_parts.extend(payload)
+            final_structured_context.append({
+                "author_id": msg.get("user", "N/A"),
+                "ts": msg.get("ts"),
+                "text": text,
+                "payload": payload
+            })
 
-        return "\n".join(final_text_parts), final_payload_parts
+        return final_structured_context
 
     except Exception as e:
         logger.error(f"Error during Flash model context extraction: {e}")
-        return "", []
+        return []
+
+
+
 
 # --- Slack Event Handlers ---
 
@@ -297,7 +409,6 @@ def extract_context_with_flash(client, channel_id, thread_ts, user_prompt):
 def handle_app_mention_events(body, say, client, logger):
     try:
         event = body["event"]
-        # Ignore messages from bots
         if event.get("bot_id"):
             return
             
@@ -308,42 +419,114 @@ def handle_app_mention_events(body, say, client, logger):
 
         thinking_message = say(text="Thinking...", thread_ts=thread_ts or message_ts, channel=channel_id)
 
+        # --- New integrated logic for context and period checking ---
         needs_context = False
-        try:
-            check_prompt = f'''Does the following user request require you to look at previous messages, threads, or files in the conversation for context? Answer with only 'True' or 'False'. Request: "{user_text}"'''
-            response = model_flash.generate_content(check_prompt)
-            if "true" in response.text.lower():
-                needs_context = True
-                logger.info("Flash model determined that context is needed.")
-        except Exception as e:
-            logger.error(f"Error with Flash model context check: {e}")
+        start_time_for_context = None
+
+        if not thread_ts: # Only do this for channel mentions
+            try:
+                flash_prompt = f'''Analyze the user's request below. Respond in JSON format.
+Your JSON should have two keys:
+1. `context_needed`: A boolean (true/false) indicating if the request requires context from past messages, threads, or files.
+2. `period`: A string representing the time period mentioned. Possible values are: "today", "yesterday", "N_days" (e.g., "3_days"), "this_week", or "none" if no period is specified.
+
+User Request: "{user_text}"
+'''
+                response = model_flash.generate_content(flash_prompt)
+                
+                # Extract JSON from the response
+                json_match = re.search(r'```json\n(.*)\n```', response.text, re.DOTALL)
+                if json_match:
+                    json_str = json_match.group(1)
+                    logger.info(f"Flash model analysis response: {json_str}")
+                    analysis = json.loads(json_str)
+                    needs_context = analysis.get("context_needed", False)
+                    period_str = analysis.get("period", "none")
+
+                    if needs_context:
+                        logger.info(f"Flash model determined context is needed. Period: {period_str}")
+                        start_time_for_context = get_start_time_from_period(period_str)
+                        if not start_time_for_context:
+                            start_time_for_context = (datetime.now() - timedelta(days=DEFAULT_CONTEXT_DAYS-1)).replace(hour=0, minute=0, second=0, microsecond=0)
+                            say(
+                                text=f"`참고` 언급된 기간이 없어 최근 {DEFAULT_CONTEXT_DAYS}일의 대화 내용을 검색했습니다. 다른 기간을 원하시면 '지난 7일' 또는 '어제'와 같이 기간을 포함하여 다시 질문해주세요.\n(No period was mentioned, so I searched the conversation history from the last {DEFAULT_CONTEXT_DAYS} days. If you want a different period, please ask again including a timeframe like 'last 7 days' or 'yesterday'.)",
+                                thread_ts=message_ts,
+                                channel=channel_id
+                            )
+                else:
+                    # Fallback for non-JSON response
+                    logger.warning("Flash model did not return valid JSON for context check. Falling back to old method.")
+                    check_prompt = f'''Does the following user request require you to look at previous messages, threads, or files in the conversation for context? Answer with only 'True' or 'False'. Request: "{user_text}"'''
+                    response = model_flash.generate_content(check_prompt)
+                    if "true" in response.text.lower():
+                        needs_context = True
+
+            except Exception as e:
+                logger.error(f"Error with Flash model context/period check: {e}")
+                needs_context = True # Default to checking context on error
+        else: # For threads, always assume context is needed from the thread
             needs_context = True
 
-        extracted_context_text = ""
-        context_payload = []
-
+        # Get structured context from past messages if needed
+        past_messages_structured = []
         if needs_context:
             client.chat_update(channel=channel_id, ts=thinking_message["ts"], text="Checking previous context... 🧐")
-            extracted_context_text, context_payload = extract_context_with_flash(client, channel_id, thread_ts, user_text)
+            # Pass the start_time to the context extraction function
+            past_messages_structured = extract_context_with_flash(
+                client, channel_id, thread_ts, user_text, start_time=start_time_for_context
+            )
 
         client.chat_update(channel=channel_id, ts=thinking_message["ts"], text="Generating response... 🤔")
         
+        # Process the current message into the same structure
         current_message_text, current_payload = process_message_for_context(event, client)
+        current_message_structured = {
+            "author_id": event.get("user", "N/A"),
+            "ts": event.get("ts"),
+            "text": current_message_text,
+            "payload": current_payload
+        }
+
+        # Build the organized prompt for the Pro model
+        prompt_parts = [
+            "You are a helpful AI assistant, Space Gemini. Please answer the user's question based on the provided conversation history.",
+            "When you mention a user, you MUST use their Slack user ID in the format <@USER_ID>.",
+            "IMPORTANT: Format your response for Slack. Do not use `**text**` for bolding. If you need to use emphasis, use `*text*` for bold or `_text_` for italics."
+        ]
+        gemini_payload = []
+
+        # Add past messages in a structured way
+        if past_messages_structured:
+            prompt_parts.append("--- Relevant Conversation History ---")
+            # Sort messages by timestamp to ensure chronological order
+            sorted_past_messages = sorted(past_messages_structured, key=lambda x: float(x['ts']))
+            for msg in sorted_past_messages:
+                readable_time = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(float(msg['ts'])))
+                author_mention = f"<@{msg['author_id']}>"
+                prompt_parts.append(f"Message from {author_mention} ({readable_time}):\n{msg['text']}")
+                gemini_payload.extend(msg['payload'])
         
-        gemini_payload = context_payload + current_payload
+        # Add current question
+        prompt_parts.append("\n--- User's Current Question ---")
+        current_readable_time = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(float(current_message_structured['ts'])))
+        current_author_mention = f"<@{current_message_structured['author_id']}>"
+        prompt_parts.append(f"Message from {current_author_mention} ({current_readable_time}):\n{current_message_structured['text']}")
+        gemini_payload.extend(current_message_structured['payload'])
 
-        prompt_text = (
-            f"You are a helpful AI assistant, Space Gemini. Please answer the user's question based on the provided context.\n"
-            f"When you mention a user, you MUST use their Slack user ID in the format <@USER_ID>.\n"
-            f"--- Extracted Context from Conversation ---\n{extracted_context_text}\n\n"
-            f"--- User's Original Question ---\n{current_message_text}"
-        )
+        final_prompt_text = "\n\n".join(prompt_parts)
+        gemini_payload.insert(0, final_prompt_text)
 
-        gemini_payload.insert(0, prompt_text)
-
-        if not user_text and not gemini_payload:
+        if not user_text and not any(p for p in gemini_payload if not isinstance(p, str)):
              client.chat_update(channel=channel_id, ts=thinking_message["ts"], text="I need a question or some text to go with the files.")
              return
+
+        # Logging for debug
+        logger.info("--- Sending payload to Gemini Pro ---")
+        logger.info(f"Prompt Text:\n{final_prompt_text}")
+        num_parts = len([p for p in gemini_payload if not isinstance(p, str)])
+        if num_parts > 0:
+            logger.info(f"Additional Parts: {num_parts} (files/images/etc.)")
+        logger.info("------------------------------------")
 
         response = model_pro.generate_content(gemini_payload)
         handle_gemini_response(client, channel_id, thinking_message, response.text, thread_ts=thread_ts or message_ts)
@@ -352,6 +535,8 @@ def handle_app_mention_events(body, say, client, logger):
         logger.error(f"Error in app_mention handler: {e}")
         event = body.get("event", {})
         say(text=f"An error occurred: {e}", thread_ts=event.get("ts"), channel=event.get("channel"))
+
+
 
 @app.event("message")
 def handle_direct_messages(body, say, client, logger):
