@@ -15,11 +15,11 @@ Translate-Gem is a bot that provides real-time message translation in Slack chan
 
 You can enable or disable real-time translation in channels where the bot has been invited using specific commands.
 
-- **Enable Translation**: ` /translate-gem-channel add `
+- **Enable Translation**: ` /translate-channel add `
   - All messages in the channel will now be translated in real-time.
-- **Disable Translation**: ` /translate-gem-channel remove `
+- **Disable Translation**: ` /translate-channel remove `
   - Real-time translation will be stopped.
-- **List Active Channels**: ` /translate-gem-channel list `
+- **List Active Channels**: ` /translate-channel list `
   - Shows a list of all channels where translation is currently active.
 
 ## 3. Usage in Direct Messages (DMs)
@@ -41,9 +41,20 @@ This feature helps standardize Notion document titles into English, following co
     >
     > :warning: Notion 페이지에 접근할 수 없습니다. 페이지가 존재하지 않거나, 저에게 접근 권한이 없는 것 같아요.
 
-## 5. Future Plans
+## 5. Notion Integration: Full Document Translation
 
-- **Full Notion Document Translation**: While only title translation is currently supported, a feature to translate the entire body of a Notion document and create a new page will be added in the future.
+This feature allows you to translate the entire content of a Notion document and create a new, translated version.
+
+- **How to Use**: Use the `/translate-notion` command followed by the Notion page URL.
+  - **Usage**: ` /translate-notion <notion_page_url> `
+- **How It Works**:
+    1. The bot fetches the entire content of the provided Notion page.
+    2. It automatically detects the primary language of the document.
+    3. Korean documents are translated into English, and documents in any other language are translated into Korean.
+    4. A new Notion page is created in the same location as the original.
+    5. The title of the new page will be the original title with `_EN` or `_KR` appended (e.g., `Original Title_EN`).
+    6. Once finished, the bot will post a link to the newly created translated page in the channel.
+- **Permission Note**: Just like with title translation, the bot needs to be invited to the Notion page to access its content. If you encounter an error, please share the page with the **`Translate Gem`** bot.
 
 ---
 
