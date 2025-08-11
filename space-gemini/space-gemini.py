@@ -257,7 +257,7 @@ def handle_gemini_response(client, channel_id, thinking_message, text, thread_ts
             with open(file_path, "w", encoding="utf-8") as f:
                 f.write(text)
             try:
-                client.chat_delete(channel=channel_id, ts=thinking_ts)
+                client.chat_delete(channel=channel_id, ts=thinking_message["ts"])
                 client.files_upload_v2(
                     channel=channel_id, file=file_path, title="Gemini AI Response",
                     initial_comment="The response was too long, so I've attached it as a file. 📄", thread_ts=thread_ts
@@ -268,110 +268,90 @@ def handle_gemini_response(client, channel_id, thinking_message, text, thread_ts
         logger.error(f"Error in handle_gemini_response: {e}")
         client.chat_postMessage(text=f"An error occurred: {e}", thread_ts=thread_ts, channel=channel_id)
 
-def extract_context_with_flash(client, channel_id, thread_ts, user_prompt):
-    """
-    Gathers conversation history, asks Flash model to identify relevant messages,
-    and processes them into a structured list. This includes content from attachments and links.
-    """
-    start_time = None
-    latest_time = None
+def get_search_criteria_from_prompt(user_prompt):
+    """Analyzes the user prompt to find search criteria like period and scope."""
+    start_time, latest_time = None, None
+    search_scope, channel_ids = "CURRENT_CHANNEL", []
+
     try:
-        period_prompt = f'''Analyze the user's request to determine the time period for a conversation history search. 
-        Today's date is {datetime.now().strftime('%Y-%m-%d')}. Respond in a structured JSON format.
+        period_prompt = f'''Analyze the user's request to determine the scope and time period for a Slack conversation search. Today's date is {datetime.now().strftime('%Y-%m-%d')}. Respond in a structured JSON format.
 
-        Your JSON output MUST contain the following keys:
-        1. `period_start`: A string representing the start date and time in "YYYY-MM-DD HH:MM:SS" format. If no start date is mentioned, respond with "none".
-        2. `period_end`: A string representing the end date and time in "YYYY-MM-DD HH:MM:SS" format. If no end date is mentioned, respond with "none".
+Your JSON output MUST contain the following keys:
+1. `search_scope`: A string indicating the search area. Possible values are: "ENTIRE_WORKSPACE", "SPECIFIC_CHANNELS", "CURRENT_THREAD", "CURRENT_CHANNEL". Default to "CURRENT_CHANNEL" if not specified.
+2. `channel_ids`: A list of Slack channel IDs (e.g., "C1234567") mentioned in the request. Extract this from channel links. If none, provide an empty list [].
+3. `period_start`: A string representing the start date and time in "YYYY-MM-DD HH:MM:SS" format. If none, respond with "none".
+4. `period_end`: A string representing the end date and time in "YYYY-MM-DD HH:MM:SS" format. If none, respond with "none".
 
-        User Request: "{user_prompt}"
-        '''
+User Request: "{user_prompt}"'''
+        logger.info(f"--- Sending Scope/Period Prompt to Flash Model ---\n{period_prompt}\n------------------------------------")
         period_response = model_flash.generate_content(period_prompt)
+        logger.info(f"--- Flash Model Scope/Period Analysis Result ---\n{period_response.text}\n------------------------------------")
 
         json_match = re.search(r'```json\n(.*)\n```', period_response.text, re.DOTALL)
         if json_match:
             json_str = json_match.group(1)
             analysis = json.loads(json_str)
+            
+            search_scope = analysis.get("search_scope", "CURRENT_CHANNEL")
+            channel_ids = analysis.get("channel_ids", [])
             period_start_str = analysis.get("period_start")
             period_end_str = analysis.get("period_end")
-            logger.info(f"Parsed period_start: {period_start_str}")
-            logger.info(f"Parsed period_end: {period_end_str}")
 
             if period_start_str and period_start_str != "none":
                 try:
                     start_time = datetime.strptime(period_start_str, "%Y-%m-%d %H:%M:%S")
                 except ValueError:
-                    start_time = datetime.strptime(period_start_str, "%Y-%m-%d") # Fallback to date only
+                    start_time = datetime.strptime(period_start_str, "%Y-%m-%d")
             
             if period_end_str and period_end_str != "none":
                 try:
                     latest_time = datetime.strptime(period_end_str, "%Y-%m-%d %H:%M:%S")
                 except ValueError:
-                    # Fallback to date only, and set to end of day
                     latest_time = datetime.strptime(period_end_str, "%Y-%m-%d").replace(hour=23, minute=59, second=59)
 
     except Exception as e:
-        logger.error(f"Error during Flash model period analysis: {e}")
+        logger.error(f"Error during Flash model scope/period analysis: {e}")
+    
+    return start_time, latest_time, search_scope, channel_ids
 
+def extract_context_with_flash(client, channel_id, thread_ts, user_prompt, search_scope, channel_ids, start_time, latest_time):
+    """
+    Gathers conversation history based on search criteria and asks Flash model to identify relevant messages.
+    """
     messages = []
-    if thread_ts:
+    # Fetching logic based on search_scope
+    if search_scope == "CURRENT_THREAD" and thread_ts:
         try:
             result = client.conversations_replies(channel=channel_id, ts=thread_ts, limit=100)
             messages = result.get("messages", [])
-            parent_message_ts = thread_ts
-            if not any(msg.get('ts') == parent_message_ts for msg in messages):
-                logger.info(f"Parent message {parent_message_ts} not in recent replies, fetching it explicitly.")
-                parent_message_response = client.conversations_history(
-                    channel=channel_id, latest=parent_message_ts, inclusive=True, limit=1
-                )
-                if parent_message_response.get("messages"):
-                    messages.insert(0, parent_message_response["messages"][0])
         except Exception as e:
             logger.error(f"Error fetching thread replies for context extraction: {e}")
-    else:
-        try:
-            history_params = {
-                'channel': channel_id,
-                'limit': 1000
-            }
-            if start_time:
-                history_params['oldest'] = str(start_time.timestamp())
-                logger.info(f"Fetching channel history since {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
-            if latest_time:
-                history_params['latest'] = str(latest_time.timestamp())
-                logger.info(f"Fetching channel history until {latest_time.strftime('%Y-%m-%d %H:%M:%S')}")
-            
-            history_result = client.conversations_history(**history_params)
-            top_level_messages = history_result.get("messages", [])
-            all_messages = []
-            processed_thread_ts = set()
-            for msg in top_level_messages:
-                all_messages.append(msg)
-                thread_ts_val = msg.get("thread_ts")
-                if thread_ts_val and thread_ts_val not in processed_thread_ts:
-                    processed_thread_ts.add(thread_ts_val)
-                    logger.info(f"Found thread {thread_ts_val} in channel history, fetching its replies.")
-                    try:
-                        replies_result = client.conversations_replies(channel=channel_id, ts=thread_ts_val)
-                        thread_messages = replies_result.get("messages", [])
-                        all_messages.extend(thread_messages)
-                    except Exception as e:
-                        logger.error(f"Error fetching replies for thread {thread_ts_val}: {e}")
-            unique_messages_dict = {msg['ts']: msg for msg in all_messages}
-            messages = list(unique_messages_dict.values())
-            messages.sort(key=lambda x: float(x['ts']), reverse=True)
-        except Exception as e:
-            logger.error(f"Error fetching channel history and threads: {e}")
+    elif search_scope in ["CURRENT_CHANNEL", "SPECIFIC_CHANNELS"]:
+        channels_to_search = channel_ids if search_scope == "SPECIFIC_CHANNELS" else [channel_id]
+        for c_id in channels_to_search:
+            try:
+                history_params = {'channel': c_id, 'limit': 1000}
+                if start_time: history_params['oldest'] = str(start_time.timestamp())
+                if latest_time: history_params['latest'] = str(latest_time.timestamp())
+                
+                history_result = client.conversations_history(**history_params)
+                messages.extend(history_result.get("messages", []))
+            except Exception as e:
+                logger.error(f"Error fetching channel history for {c_id}: {e}")
 
     if not messages:
         return []
 
+    # Consolidate thread messages if necessary (this part might need refinement)
+    # For simplicity, we are not fetching all replies for all threads in channel history for now.
+
+    # Identify relevant messages using Flash model
     structured_history = []
     for msg in messages:
         user_info = get_user_info(msg.get("user", "N/A"))
         user_name = user_info.get("name")
-        has_files = "has attachments or links" if msg.get('files') or 'http' in msg.get('text', '') else ""
-        message_preview = msg.get("text", "")[:150] 
-        structured_history.append(f"(message_id='{msg.get('ts')}', author='{user_name}', message='{message_preview}...', info='{has_files}')")
+        message_preview = msg.get("text", "")[:150]
+        structured_history.append(f"(message_id='{msg.get('ts')}', author='{user_name}', message='{message_preview}...')")
     
     history_string = "\n".join(structured_history)
 
@@ -409,7 +389,6 @@ def extract_context_with_flash(client, channel_id, thread_ts, user_prompt):
         return []
 
 
-
 # --- Slack Event Handlers ---
 
 @app.event("app_mention")
@@ -426,6 +405,7 @@ def handle_app_mention_events(body, say, client, logger):
 
         thinking_message = say(text="Thinking...", thread_ts=thread_ts or message_ts, channel=channel_id)
 
+        # Step 1: Determine if context is needed at all
         try:
             check_prompt = f"Does the following user request require you to look at previous messages, threads, files, or links in the conversation for context? Answer with only 'True' or 'False'.\n\nUser Request: \"{user_text}\""
             response = model_flash.generate_content(check_prompt)
@@ -433,13 +413,23 @@ def handle_app_mention_events(body, say, client, logger):
             needs_context = "true" in response.text.lower()
         except Exception as e:
             logger.error(f"Error with Flash model context_needed check: {e}")
-            needs_context = True # Default to true on error
+            needs_context = True
 
         past_messages_structured = []
         if needs_context:
-            client.chat_update(channel=channel_id, ts=thinking_message["ts"], text="Checking previous context... 🧐")
+            client.chat_update(channel=channel_id, ts=thinking_message["ts"], text="Analyzing request and checking context... 🧐")
+            
+            # Step 2: Get detailed search criteria
+            start_time, latest_time, search_scope, channel_ids = get_search_criteria_from_prompt(user_prompt=user_text)
+            logger.info("start_time, latest_time, search_scope, channel_ids: ", start_time, latest_time, search_scope, channel_ids)
+            if search_scope == "ENTIRE_WORKSPACE":
+                client.chat_update(channel=channel_id, ts=thinking_message["ts"], text="죄송합니다, 아직 전체 채널을 검색하는 기능은 지원하지 않습니다.\n\nSorry, searching all channels is not supported yet.")
+                return
+
+            # Step 3: Fetch and process the context based on criteria
             past_messages_structured = extract_context_with_flash(
-                client, channel_id, thread_ts, user_text
+                client, channel_id, thread_ts, user_text, 
+                search_scope, channel_ids, start_time, latest_time
             )
 
         client.chat_update(channel=channel_id, ts=thinking_message["ts"], text="Generating response... 🤔")
@@ -460,7 +450,7 @@ def handle_app_mention_events(body, say, client, logger):
         gemini_payload = []
 
         if past_messages_structured:
-            prompt_parts.append("--- Relevant Conversation History ---")
+            prompt_parts.append("---")
             sorted_past_messages = sorted(past_messages_structured, key=lambda x: float(x['ts']))
             for msg in sorted_past_messages:
                 readable_time = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(float(msg['ts'])))
@@ -468,7 +458,7 @@ def handle_app_mention_events(body, say, client, logger):
                 prompt_parts.append(f"Message from {author_mention} ({readable_time}):\n{msg['text']}")
                 gemini_payload.extend(msg['payload'])
         
-        prompt_parts.append("\n--- User's Current Question ---")
+        prompt_parts.append("\n---")
         current_readable_time = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(float(current_message_structured['ts'])))
         current_author_mention = f"<@{current_message_structured['author_id']}>"
         prompt_parts.append(f"Message from {current_author_mention} ({current_readable_time}):\n{current_message_structured['text']}")
@@ -481,12 +471,12 @@ def handle_app_mention_events(body, say, client, logger):
              client.chat_update(channel=channel_id, ts=thinking_message["ts"], text="I need a question or some text to go with the files.")
              return
 
-        logger.info("--- Sending payload to Gemini Pro ---")
+        logger.info("---")
         logger.info(f"Prompt Text:\n{final_prompt_text}")
         num_parts = len([p for p in gemini_payload if not isinstance(p, str)])
         if num_parts > 0:
             logger.info(f"Additional Parts: {num_parts} (files/images/etc.)")
-        logger.info("------------------------------------")
+        logger.info("---")
 
         response = model_pro.generate_content(gemini_payload)
         handle_gemini_response(client, channel_id, thinking_message, response.text, thread_ts=thread_ts or message_ts)
