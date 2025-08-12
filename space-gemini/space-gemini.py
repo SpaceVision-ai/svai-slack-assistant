@@ -4,6 +4,7 @@ import time
 import requests
 import io
 import json
+import threading
 from dotenv import load_dotenv
 from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
@@ -283,9 +284,9 @@ Your JSON output MUST contain the following keys:
 4. `period_end`: A string representing the end date and time in "YYYY-MM-DD HH:MM:SS" format. If none, respond with "none".
 
 User Request: "{user_prompt}"'''
-        logger.info(f"--- Sending Scope/Period Prompt to Flash Model ---\n{period_prompt}\n------------------------------------")
+        logger.info(f"--- Sending Scope/Period Prompt to Flash Model ---{period_prompt}------------------------------------")
         period_response = model_flash.generate_content(period_prompt)
-        logger.info(f"--- Flash Model Scope/Period Analysis Result ---\n{period_response.text}\n------------------------------------")
+        logger.info(f"--- Flash Model Scope/Period Analysis Result ---{period_response.text}------------------------------------")
 
         json_match = re.search(r'```json\n(.*)\n```', period_response.text, re.DOTALL)
         if json_match:
@@ -296,6 +297,8 @@ User Request: "{user_prompt}"'''
             channel_ids = analysis.get("channel_ids", [])
             period_start_str = analysis.get("period_start")
             period_end_str = analysis.get("period_end")
+            logger.info(f"Parsed period_start from Flash model: {period_start_str}")
+            logger.info(f"Parsed period_end from Flash model: {period_end_str}")
 
             if period_start_str and period_start_str != "none":
                 try:
@@ -314,18 +317,50 @@ User Request: "{user_prompt}"'''
     
     return start_time, latest_time, search_scope, channel_ids
 
-def extract_context_with_flash(client, channel_id, thread_ts, user_prompt, search_scope, channel_ids, start_time, latest_time):
+def summarize_content(content, user_prompt, source_name, logger, model_flash):
+    """Summarizes text content from a file or URL based on the user's prompt."""
+    if len(content.split()) < 50:
+        logger.info(f"Content from '{source_name}' is too short to summarize, using full content.")
+        return content
+    try:
+        prompt = f"""The following text is from the source '{source_name}'. Please read it and provide a concise summary that is relevant to the user's original request.
+
+**IMPORTANT**: Your summary MUST be less than 4000 characters.
+
+[User Request]
+{user_prompt}
+
+[Source Content]
+{content[:15000]}
+
+[Summary]
+"""
+        logger.info(f"Summarizing content from '{source_name}' for user prompt: '{user_prompt}'")
+        response = model_flash.generate_content(prompt)
+        logger.info(f"Finished summarizing content from '{source_name}'.")
+        return response.text
+    except Exception as e:
+        logger.error(f"Error summarizing content from {source_name}: {e}")
+        return f"[Could not summarize content from {source_name}. Truncated content follows]\n{content[:2000]}..."
+
+
+
+def extract_context_with_flash(client, channel_id, thread_ts, user_prompt, search_scope, channel_ids, start_time, latest_time, thinking_message):
     """
-    Gathers conversation history based on search criteria and asks Flash model to identify relevant messages.
+    Gathers conversation history, chunks it, and uses the Flash model to summarize relevant parts,
+    including filtering for essential attachments and links.
     """
-    messages = []
-    # Fetching logic based on search_scope
+    all_messages_dict = {}
+
+    # 1. GATHER MESSAGES
     if search_scope == "CURRENT_THREAD" and thread_ts:
         try:
             result = client.conversations_replies(channel=channel_id, ts=thread_ts, limit=100)
-            messages = result.get("messages", [])
+            for msg in result.get("messages", []):
+                all_messages_dict[msg['ts']] = msg
         except Exception as e:
             logger.error(f"Error fetching thread replies for context extraction: {e}")
+    
     elif search_scope in ["CURRENT_CHANNEL", "SPECIFIC_CHANNELS"]:
         channels_to_search = channel_ids if search_scope == "SPECIFIC_CHANNELS" else [channel_id]
         for c_id in channels_to_search:
@@ -335,156 +370,338 @@ def extract_context_with_flash(client, channel_id, thread_ts, user_prompt, searc
                 if latest_time: history_params['latest'] = str(latest_time.timestamp())
                 
                 history_result = client.conversations_history(**history_params)
-                messages.extend(history_result.get("messages", []))
+                top_level_messages = history_result.get("messages", [])
+
+                for msg in top_level_messages:
+                    all_messages_dict[msg['ts']] = msg
+                    if 'thread_ts' in msg and msg.get('reply_count', 0) > 0:
+                        try:
+                            logger.info(f"Found thread {msg['thread_ts']} in channel {c_id}, fetching its replies.")
+                            replies_result = client.conversations_replies(channel=c_id, ts=msg['thread_ts'])
+                            for reply_msg in replies_result.get("messages", []):
+                                all_messages_dict[reply_msg['ts']] = reply_msg
+                        except Exception as e:
+                            logger.error(f"Error fetching replies for thread {msg['thread_ts']}: {e}")
             except Exception as e:
                 logger.error(f"Error fetching channel history for {c_id}: {e}")
 
-    if not messages:
+    if not all_messages_dict:
         return []
 
-    # Consolidate thread messages if necessary (this part might need refinement)
-    # For simplicity, we are not fetching all replies for all threads in channel history for now.
+    # 2. STRUCTURE CONVERSATION FOR SUMMARIZATION
+    threads = {}
+    for ts, msg in all_messages_dict.items():
+        thread_key = msg.get('thread_ts', ts)
+        if thread_key not in threads:
+            threads[thread_key] = []
+        threads[thread_key].append(msg)
 
-    # Identify relevant messages using Flash model
-    structured_history = []
-    for msg in messages:
-        user_info = get_user_info(msg.get("user", "N/A"))
-        user_name = user_info.get("name")
-        message_preview = msg.get("text", "")[:150]
-        structured_history.append(f"(message_id='{msg.get('ts')}', author='{user_name}', message='{message_preview}...')")
+    for thread_key in threads:
+        threads[thread_key].sort(key=lambda x: float(x['ts']))
+
+    conversation_string = ""
+    sorted_thread_keys = sorted(threads.keys(), key=float)
+    for thread_key in sorted_thread_keys:
+        thread_messages = threads[thread_key]
+        conversation_string += f"\n--- Thread starting at {thread_key} ---"
+        for msg in thread_messages:
+            user_info = get_user_info(msg.get("user", "N/A"))
+            user_name = user_info.get("name")
+            text = msg.get("text", "")
+            files = [f.get('name', 'file') for f in msg.get('files', [])]
+            urls = re.findall(r'<?(https?://[\w\-./?=&%#]+)>?', text)
+            
+            conversation_string += f"Timestamp: {msg['ts']}\nAuthor: {user_name}\nMessage: {text}\n"
+            if files:
+                conversation_string += f"Files: {', '.join(files)}\n"
+            if urls:
+                conversation_string += f"Links: {', '.join(urls)}\n"
+            conversation_string += "---"
+
+    # 3. CHUNKING
+    MAX_CHUNK_SIZE = 3500
+    chunks = []
+    current_chunk = ""
+    for line in conversation_string.splitlines(True):
+        if len(current_chunk) + len(line) > MAX_CHUNK_SIZE:
+            chunks.append(current_chunk)
+            current_chunk = ""
+        current_chunk += line
+    if current_chunk:
+        chunks.append(current_chunk)
+
+    final_structured_context = []
     
-    history_string = "\n".join(structured_history)
-
     try:
-        flash_prompt = f"""You are a context analysis expert. From the 'Previous Slack Conversation' below, identify which message_ids are essential for answering the 'User Prompt'. Consider messages with key info, questions, decisions, and attachments. Respond with only a comma-separated list of the necessary message_ids (e.g., '1629888000.000100,1629888001.000200'). If no context is needed, respond with an empty string.
+        # 4. NEW FLASH PROMPT & PROCESSING
+        for i, chunk in enumerate(chunks):
+            if len(chunks) > 1:
+                logger.info(f"Processing chunk {i+1}/{len(chunks)} for summarization.")
+                try:
+                    client.chat_update(channel=thinking_message['channel'], ts=thinking_message['ts'], text=f"Analyzing context... (Chunk {i+1}/{len(chunks)}) 🧐")
+                except Exception as e:
+                    logger.warning(f"Could not update progress message: {e}")
+            else:
+                logger.info("Processing single chunk for summarization.")
+            flash_prompt = f"""You are a conversation summarization expert. Your task is to analyze a snippet of a Slack conversation and extract key information relevant to the user's request.
 
-[Previous Slack Conversation]
-{history_string}
+Respond with a JSON array of objects. Each object represents a single, coherent \"context unit\" and MUST have the following structure:
+{{
+  "summary": "A concise summary of the relevant discussion point.",
+  "relevant_messages": [
+    {{
+      "message_id": "The timestamp of a relevant message (e.g., '1629888000.000100').",
+      "files": ["A list of filenames (e.g., 'report.pdf') from this specific message that are relevant to the summary."],
+      "links": ["A list of URLs from this specific message that are relevant to the summary."]
+    }}
+  ]
+}}
+
+If a part of the conversation is irrelevant, do not create a context unit for it. If nothing in this snippet is relevant, return an empty array [].
 
 [User Prompt]
 {user_prompt}
+
+[Conversation Snippet]
+{chunk}
 """
-        flash_response = model_flash.generate_content(flash_prompt)
-        relevant_message_ids = {ts.strip() for ts in flash_response.text.split(',') if ts.strip()}
+            flash_response = model_flash.generate_content(flash_prompt)
+            
+            logger.info(f"--- Raw Flash Model JSON Response (Chunk {i+1}) ---\n{flash_response.text}")
+            json_match = re.search(r'```json(.*)```', flash_response.text, re.DOTALL)
+            if not json_match:
+                if flash_response.text.strip().startswith('['):
+                    json_str = flash_response.text.strip()
+                else:
+                    logger.warning(f"Could not find JSON in Flash response for chunk {i+1}")
+                    continue
+            else:
+                json_str = json_match.group(1)
 
-        if not relevant_message_ids:
-            return []
+            try:
+                summarized_units = json.loads(json_str)
+            except json.JSONDecodeError:
+                logger.error(f"Failed to decode JSON from Flash response for chunk {i+1}:\n{flash_response.text}")
+                continue
 
-        final_structured_context = []
-        relevant_messages = [msg for msg in messages if msg.get("ts") in relevant_message_ids]
-        
-        for msg in relevant_messages:
-            text, payload = process_message_for_context(msg, client)
-            final_structured_context.append({
-                "author_id": msg.get("user", "N/A"),
-                "ts": msg.get("ts"),
-                "text": text,
-                "payload": payload
-            })
+            # 5. PROCESS THE SUMMARIZED UNITS
+            for unit in summarized_units:
+                summary_text = unit.get("summary", "")
+                relevant_messages_data = unit.get("relevant_messages", [])
+
+                if not summary_text or not relevant_messages_data:
+                    continue
+
+                combined_text_parts = [f"Summary of conversation: {summary_text}"]
+                combined_payload_parts = []
+                
+                all_relevant_ids = [msg_data.get("message_id") for msg_data in relevant_messages_data if isinstance(msg_data, dict) and msg_data.get("message_id")]
+                if not all_relevant_ids:
+                    continue
+
+                for msg_data in relevant_messages_data:
+                    if not isinstance(msg_data, dict): continue
+                    
+                    msg_id = msg_data.get("message_id")
+                    if not msg_id: continue
+
+                    original_msg = all_messages_dict.get(msg_id)
+                    if not original_msg: continue
+
+                    relevant_files_for_msg = msg_data.get("files", [])
+                    relevant_links_for_msg = msg_data.get("links", [])
+
+                    if relevant_files_for_msg and "files" in original_msg:
+                        file_infos_to_process = [f for f in original_msg["files"] if f.get("name") in relevant_files_for_msg]
+                        for file_info in file_infos_to_process:
+                            try:
+                                file_name = file_info.get("name")
+                                mime_type = file_info.get("mimetype", "application/octet-stream")
+                                content_bytes = download_file(file_info["url_private_download"], SLACK_BOT_TOKEN)
+                                
+                                if mime_type.startswith(("image/", "video/")):
+                                    logger.info(f"Adding relevant media file to payload: {file_name}")
+                                    combined_payload_parts.append(Part.from_data(content_bytes, mime_type=mime_type))
+                                    combined_text_parts.append(f"\n[Info: Including relevant attachment: {file_name}]\n")
+                                    continue
+
+                                text_content = ""
+                                if mime_type == "application/pdf":
+                                    text_content = extract_text_from_pdf(content_bytes)
+                                elif mime_type == "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
+                                    text_content = extract_text_from_docx(content_bytes)
+                                elif mime_type.startswith("text/"):
+                                    text_content = content_bytes.decode('utf-8', errors='ignore')
+
+                                if text_content:
+                                    summary = summarize_content(text_content, user_prompt, file_name, logger, model_flash)
+                                    combined_text_parts.append(f"\n--- Summary from file ({file_name}) ---\n{summary}\n")
+
+                            except Exception as e:
+                                logger.error(f"Error processing and summarizing file {file_info.get('name')}: {e}")
+
+                    if relevant_links_for_msg:
+                        for url in relevant_links_for_msg:
+                            try:
+                                content = ""
+                                source_name = url
+                                if 'notion.so' in url or 'notion.site' in url:
+                                    page_id = get_page_id_from_url(url)
+                                    if page_id:
+                                        content = fetch_notion_page_content(page_id)
+                                elif 'slack.com' in url:
+                                    combined_text_parts.append(f"\n[Info: Content from relevant Slack link is included in conversation summary: {url}]\n")
+                                    continue
+                                else:
+                                    content = fetch_website_content(url)
+                                
+                                if content:
+                                    summary = summarize_content(content, user_prompt, source_name, logger, model_flash)
+                                    combined_text_parts.append(f"\n--- Summary from URL ({source_name}) ---\n{summary}\n")
+                            except Exception as e:
+                                logger.error(f"Error processing and summarizing URL {url}: {e}")
+
+                last_ts = sorted(all_relevant_ids, key=float)[-1]
+                
+                final_structured_context.append({
+                    "author_id": "SUMMARY_BOT",
+                    "ts": last_ts,
+                    "thread_ts": all_messages_dict.get(last_ts, {}).get('thread_ts'),
+                    "text": "\n".join(combined_text_parts),
+                    "payload": combined_payload_parts
+                })
 
         return final_structured_context
 
     except Exception as e:
-        logger.error(f"Error during Flash model context extraction: {e}")
+        logger.error(f"Error during Flash model context summarization: {e}")
         return []
+
 
 
 # --- Slack Event Handlers ---
 
 @app.event("app_mention")
 def handle_app_mention_events(body, say, client, logger):
-    try:
-        event = body["event"]
-        if event.get("bot_id"):
-            return
-            
-        user_text = event.get("text", "").strip()
-        channel_id = event["channel"]
-        message_ts = event.get("ts")
-        thread_ts = event.get("thread_ts")
+    event = body["event"]
+    if event.get("bot_id"):
+        return
 
-        thinking_message = say(text="Thinking...", thread_ts=thread_ts or message_ts, channel=channel_id)
+    thinking_message = say(text="Thinking...", thread_ts=event.get("thread_ts") or event.get("ts"))
 
-        # Step 1: Determine if context is needed at all
+    def process_in_background():
         try:
-            check_prompt = f"Does the following user request require you to look at previous messages, threads, files, or links in the conversation for context? Answer with only 'True' or 'False'.\n\nUser Request: \"{user_text}\""
-            response = model_flash.generate_content(check_prompt)
-            logger.info(f"Flash model 'context_needed' check response: {response.text}")
-            needs_context = "true" in response.text.lower()
-        except Exception as e:
-            logger.error(f"Error with Flash model context_needed check: {e}")
-            needs_context = True
-
-        past_messages_structured = []
-        if needs_context:
-            client.chat_update(channel=channel_id, ts=thinking_message["ts"], text="Analyzing request and checking context... 🧐")
+            user_text = event.get("text", "").strip()
+            channel_id = event["channel"]
+            thread_ts = event.get("thread_ts")
             
-            # Step 2: Get detailed search criteria
-            start_time, latest_time, search_scope, channel_ids = get_search_criteria_from_prompt(user_prompt=user_text)
-            logger.info("start_time, latest_time, search_scope, channel_ids: ", start_time, latest_time, search_scope, channel_ids)
-            if search_scope == "ENTIRE_WORKSPACE":
-                client.chat_update(channel=channel_id, ts=thinking_message["ts"], text="죄송합니다, 아직 전체 채널을 검색하는 기능은 지원하지 않습니다.\n\nSorry, searching all channels is not supported yet.")
-                return
+            # Step 1: Determine if context is needed at all
+            try:
+                check_prompt = f"Does the following user request require you to look at previous messages, threads, files, or links in the conversation for context? Answer with only 'True' or 'False'.\n\nUser Request: \"{user_text}\""
+                response = model_flash.generate_content(check_prompt)
+                logger.info(f"Flash model 'context_needed' check response: {response.text}")
+                needs_context = "true" in response.text.lower()
+            except Exception as e:
+                logger.error(f"Error with Flash model context_needed check: {e}")
+                needs_context = True
 
-            # Step 3: Fetch and process the context based on criteria
-            past_messages_structured = extract_context_with_flash(
-                client, channel_id, thread_ts, user_text, 
-                search_scope, channel_ids, start_time, latest_time
-            )
+            past_messages_structured = []
+            if needs_context:
+                client.chat_update(channel=channel_id, ts=thinking_message["ts"], text="Analyzing request and checking context... 🧐")
+                
+                # Step 2: Get detailed search criteria
+                start_time, latest_time, search_scope, channel_ids = get_search_criteria_from_prompt(user_prompt=user_text)
+                
+                if search_scope == "ENTIRE_WORKSPACE":
+                    client.chat_update(channel=channel_id, ts=thinking_message["ts"], text="아직 전체 채널을 대상으로 검색하는 기능은 지원하지 않습니다.\n\nSorry, searching all channels is not supported yet.")
+                    return
 
-        client.chat_update(channel=channel_id, ts=thinking_message["ts"], text="Generating response... 🤔")
-        
-        current_message_text, current_payload = process_message_for_context(event, client)
-        current_message_structured = {
-            "author_id": event.get("user", "N/A"),
-            "ts": event.get("ts"),
-            "text": current_message_text,
-            "payload": current_payload
-        }
+                # Step 3: Fetch and process the context based on criteria
+                past_messages_structured = extract_context_with_flash(
+                    client, channel_id, thread_ts, user_text, 
+                    search_scope, channel_ids, start_time, latest_time, thinking_message
+                )
+                logger.info(f"extract_context_with_flash found {len(past_messages_structured)} messages for context.")
+                if past_messages_structured:
+                    logger.info("--- Start of Summarized Context Units ---")
+                    loggable_context = []
+                    for unit in past_messages_structured:
+                        loggable_unit = {
+                            "author_id": unit.get("author_id"),
+                            "ts": unit.get("ts"),
+                            "thread_ts": unit.get("thread_ts"),
+                            "text_summary": unit.get("text", "")[:500] + "...",
+                            "payload_info": [p.mime_type for p in unit.get("payload", []) if hasattr(p, 'mime_type')]
+                        }
+                        loggable_context.append(loggable_unit)
+                    
+                    try:
+                        logger.info(json.dumps(loggable_context, indent=2, ensure_ascii=False))
+                    except TypeError as e:
+                        logger.error(f"Could not serialize context units for logging: {e}")
+                        logger.info(str(loggable_context))
+                    logger.info("--- End of Summarized Context Units ---")
 
-        prompt_parts = [
-            "You are a helpful AI assistant, Space Gemini. Please answer the user's question based on the provided conversation history.",
-            "When you mention a user, you MUST use their Slack user ID in the format <@USER_ID>.",
-            "IMPORTANT: Format your response for Slack. Do not use `**text**` for bolding. If you need to use emphasis, use `*text*` for bold or `_text_` for italics."
-        ]
-        gemini_payload = []
+            client.chat_update(channel=channel_id, ts=thinking_message["ts"], text="Generating response... 🤔")
+            
+            current_message_text, current_payload = process_message_for_context(event, client)
+            current_message_structured = {
+                "author_id": event.get("user", "N/A"),
+                "ts": event.get("ts"),
+                "thread_ts": event.get("thread_ts"),
+                "text": current_message_text,
+                "payload": current_payload
+            }
 
-        if past_messages_structured:
-            prompt_parts.append("---")
-            sorted_past_messages = sorted(past_messages_structured, key=lambda x: float(x['ts']))
-            for msg in sorted_past_messages:
-                readable_time = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(float(msg['ts'])))
-                author_mention = f"<@{msg['author_id']}>"
-                prompt_parts.append(f"Message from {author_mention} ({readable_time}):\n{msg['text']}")
-                gemini_payload.extend(msg['payload'])
-        
-        prompt_parts.append("\n---")
-        current_readable_time = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(float(current_message_structured['ts'])))
-        current_author_mention = f"<@{current_message_structured['author_id']}>"
-        prompt_parts.append(f"Message from {current_author_mention} ({current_readable_time}):\n{current_message_structured['text']}")
-        gemini_payload.extend(current_message_structured['payload'])
+            prompt_parts = [
+                "You are a helpful AI assistant, Space Gemini. Please answer the user's question based on the provided conversation history.",
+                "When you mention a user, you MUST use their Slack user ID in the format <@USER_ID>.",
+                "IMPORTANT: Format your response for Slack. Do not use `**text**` for bolding. If you need to use emphasis, use `*text*` for bold or `_text_` for italics."
+            ]
+            gemini_payload = []
 
-        final_prompt_text = "\n\n".join(prompt_parts)
-        gemini_payload.insert(0, final_prompt_text)
+            if past_messages_structured:
+                prompt_parts.append("---")
+                sorted_past_messages = sorted(past_messages_structured, key=lambda x: float(x['ts']))
+                for msg in sorted_past_messages:
+                    readable_time = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(float(msg['ts'])))
+                    author_mention = f"<@{msg['author_id']}>"
+                    is_reply = msg.get("thread_ts") and msg.get("ts") != msg.get("thread_ts")
+                    prefix = "Reply from" if is_reply else "Message from"
+                    prompt_parts.append(f"{prefix} {author_mention} ({readable_time}):\n{msg['text']}")
+                    gemini_payload.extend(msg['payload'])
+            
+            prompt_parts.append("\n---")
+            current_readable_time = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(float(current_message_structured['ts'])))
+            current_author_mention = f"<@{current_message_structured['author_id']}>"
+            is_current_reply = current_message_structured.get("thread_ts") and current_message_structured.get("ts") != current_message_structured.get("thread_ts")
+            current_prefix = "Reply from" if is_current_reply else "Message from"
+            prompt_parts.append(f"{current_prefix} {current_author_mention} ({current_readable_time}):\n{current_message_structured['text']}")
+            gemini_payload.extend(current_message_structured['payload'])
 
-        if not user_text and not any(p for p in gemini_payload if not isinstance(p, str)):
-             client.chat_update(channel=channel_id, ts=thinking_message["ts"], text="I need a question or some text to go with the files.")
-             return
+            final_prompt_text = "\n\n".join(prompt_parts)
+            gemini_payload.insert(0, final_prompt_text)
 
-        logger.info("---")
-        logger.info(f"Prompt Text:\n{final_prompt_text}")
-        num_parts = len([p for p in gemini_payload if not isinstance(p, str)])
-        if num_parts > 0:
-            logger.info(f"Additional Parts: {num_parts} (files/images/etc.)")
-        logger.info("---")
+            if not user_text and not any(p for p in gemini_payload if not isinstance(p, str)):
+                 client.chat_update(channel=channel_id, ts=thinking_message["ts"], text="I need a question or some text to go with the files.")
+                 return
 
-        response = model_pro.generate_content(gemini_payload)
-        handle_gemini_response(client, channel_id, thinking_message, response.text, thread_ts=thread_ts or message_ts)
+            logger.info("---")
+            logger.info(f"Prompt Text:\n{final_prompt_text}")
+            num_parts = len([p for p in gemini_payload if not isinstance(p, str)])
+            if num_parts > 0:
+                logger.info(f"Additional Parts: {num_parts} (files/images/etc.)")
+            logger.info("---")
 
-    except Exception as e:
-        logger.error(f"Error in app_mention handler: {e}")
-        event = body.get("event", {})
-        say(text=f"An error occurred: {e}", thread_ts=event.get("ts"), channel=event.get("channel"))
+            response = model_pro.generate_content(gemini_payload)
+            handle_gemini_response(client, channel_id, thinking_message, response.text, thread_ts=thread_ts or event.get("ts"))
+
+        except Exception as e:
+            logger.error(f"Error in app_mention background task: {e}")
+            client.chat_postMessage(text=f"An error occurred: {e}", thread_ts=event.get("ts"), channel=event.get("channel"))
+
+    thread = threading.Thread(target=process_in_background)
+    thread.start()
 
 
 
