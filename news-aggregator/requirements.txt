@@ -2,3 +2,4 @@ feedparser
 google-cloud-aiplatform
 python-dotenv
 pyyaml
+slack-sdk

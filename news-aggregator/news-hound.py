@@ -2,13 +2,14 @@ import feedparser
 import os
 import yaml
 import vertexai
-from vertexai.generative_models import GenerativeModel, GenerationConfig
+from vertexai.generative_models import GenerativeModel
 from dotenv import load_dotenv
 import sqlite3
 from datetime import datetime
+from slack_sdk import WebClient
+from slack_sdk.errors import SlackApiError
 
-# Load environment variables from .env files in parent and local directory.
-# The local .env file will override the parent .env file.
+# Load environment variables from .env files
 load_dotenv(dotenv_path=os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '.env'))
 load_dotenv(dotenv_path=os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env'), override=True)
 
@@ -48,21 +49,22 @@ def is_article_processed(link):
         return cursor.fetchone() is not None
 
 # --- Configuration ---
-# The script now reads GOOGLE_CLOUD_PROJECT and GOOGLE_CLOUD_LOCATION from the .env file.
-# Make sure to authenticate with Google Cloud CLI:
-# gcloud auth application-default login
-
 PROJECT_ID = os.getenv("GOOGLE_CLOUD_PROJECT")
 LOCATION = os.getenv("GOOGLE_CLOUD_LOCATION")
+SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN")
+SLACK_CHANNEL = os.getenv("SLACK_CHANNEL")
 
-# Initialize Vertex AI
-try:
-    vertexai.init(project=PROJECT_ID, location=LOCATION)
-    model = GenerativeModel("gemini-2.5-flash")
-    print("Vertex AI initialized successfully.")
-except Exception as e:
-    print(f"Error initializing Vertex AI: {e}")
-    model = None
+# --- Main Application Logic ---
+def initialize_vertex_ai():
+    """Initializes Vertex AI and returns the model."""
+    try:
+        vertexai.init(project=PROJECT_ID, location=LOCATION)
+        model = GenerativeModel("gemini-2.5-flash")
+        print("Vertex AI initialized successfully.")
+        return model
+    except Exception as e:
+        print(f"Error initializing Vertex AI: {e}")
+        return None
 
 def read_feeds_from_yaml(file_path):
     """Reads a list of RSS feed URLs from a YAML file."""
@@ -75,27 +77,18 @@ def read_context(file_path):
     with open(file_path, 'r') as f:
         return f.read().strip()
 
-def check_relevance_with_llm(article_title, article_summary, context):
-    """
-    Checks if an article is relevant to the given context using Vertex AI Gemini.
-    Returns a tuple: (is_relevant, reason).
-    """
+def check_relevance_with_llm(model, article_title, article_summary, context):
+    """Checks if an article is relevant to the given context using Vertex AI Gemini."""
     if not model:
         return False, "Vertex AI model not initialized. Skipping relevance check."
-
-    prompt = f"""
-    Context:
-    ---
-    {context}
-    ---
-    Article Title: {article_title}
-    Article Summary: {article_summary}
-    ---
-    Is the article relevant to the context provided?
-    If yes, please explain the connection in one sentence.
-    Your response must be in Korean and start with "Yes:" or "No:".
-    """
-
+    prompt = f"""Context:
+---
+{context}
+---
+Article Title: {article_title}
+Article Summary: {article_summary}
+---
+Is the article relevant to the context provided? If yes, please explain the connection in one sentence. Your response must be in Korean and start with \"Yes:\" or \"No:\"."""
     try:
         response = model.generate_content(prompt)
         result = response.text.strip()
@@ -107,80 +100,98 @@ def check_relevance_with_llm(article_title, article_summary, context):
         print(f"An error occurred while contacting Vertex AI: {e}")
         return False, "Error during relevance check."
 
-def search_news(feeds, context):
-    """
-    Searches news from feeds and prints articles relevant to the context.
-    """
-    print(f"\n## Checking news for relevance against context...")
-    print("-" * 40)
-
+def search_news(model, feeds, context):
+    """Searches news from feeds and returns a list of relevant articles."""
+    print("\n## Searching for relevant news...")
     all_found_articles = []
-
     for feed_url in feeds:
         try:
             feed = feedparser.parse(feed_url)
-            source_name = feed.feed.title
-            print(f"\n### Checking source: {source_name}")
-            print(f"  -> Found {len(feed.entries)} entries in the feed.")
-
+            print(f"\n### Checking source: {feed.feed.title} ({len(feed.entries)} entries)")
             for entry in feed.entries:
+                link = entry.link
+                if is_article_processed(link):
+                    continue
+                
                 title = entry.title if hasattr(entry, 'title') else ''
                 summary = entry.summary if hasattr(entry, 'summary') else ''
-                link = entry.link
                 published = entry.get('published', 'N/A')
 
-                if is_article_processed(link):
-                    print(f"  -> Skipping already processed article: {title}")
-                    continue
-
-                is_relevant, reason = check_relevance_with_llm(title, summary, context)
-                
-                # Mark article as processed regardless of relevance
-                add_processed_article(link, title, published)
+                is_relevant, reason = check_relevance_with_llm(model, title, summary, context)
+                add_processed_article(link, title, published) # Mark as processed
 
                 if is_relevant:
+                    print(f"  -> Relevant article found: {title}")
                     article_data = {
                         'title': title,
                         'link': link,
-                        'published': published,
-                        'source': source_name,
                         'relevance_reason': reason
                     }
-                    if link not in [a['link'] for a in all_found_articles]:
-                        all_found_articles.append(article_data)
-                        print(f"  -> Relevant article found: {title}\n     reason: {reason}")
-
+                    all_found_articles.append(article_data)
         except Exception as e:
             print(f"Could not parse feed {feed_url}. Error: {e}")
+    return all_found_articles
 
+def post_news_to_slack(articles, channel):
+    """Posts the list of relevant articles to a Slack channel."""
+    client = WebClient(token=SLACK_BOT_TOKEN)
+    try:
+        parent_message_result = client.chat_postMessage(
+            channel=channel,
+            text=":newspaper: 오늘의 뉴스"
+        )
+        parent_ts = parent_message_result['ts']
+        print(f"Successfully posted parent message to channel {channel}")
 
-    print("\n" + "="*40)
-    print("            RELEVANT NEWS REPORT")
-    print("="*40 + "\n")
+        for article in articles:
+            reply_text = f"<{article['link']}|*{article['title']}*>\n{article['relevance_reason']}"
+            client.chat_postMessage(
+                channel=channel,
+                thread_ts=parent_ts,
+                text=reply_text
+            )
+        print(f"Successfully posted {len(articles)} articles to the thread.")
 
-    if all_found_articles:
-        for article in all_found_articles:
-            print(f"- **{article['title']}**")
-            print(f"  - Source: {article['source']}")
-            print(f"  - Link: {article['link']}")
-            print(f"  - Published: {article['published']}")
-            print(f"  - Relevance: {article['relevance_reason']}")
-            print("-" * 20)
-    else:
-        print("  -> No relevant news found across all feeds.")
-
+    except SlackApiError as e:
+        print(f"Error posting to Slack: {e.response['error']}")
 
 if __name__ == "__main__":
+    # Initialization
     init_db()
-    if not PROJECT_ID or not LOCATION:
-        print("Error: GOOGLE_CLOUD_PROJECT and GOOGLE_CLOUD_LOCATION environment variables must be set.")
-        print("Please create a .env file with these values or set them in your shell.")
+    print("Checking configurations...")
+
+    # 1. Check for essential environment variables
+    missing_vars = []
+    if not PROJECT_ID:
+        missing_vars.append("GOOGLE_CLOUD_PROJECT")
+    if not LOCATION:
+        missing_vars.append("GOOGLE_CLOUD_LOCATION")
+    if not SLACK_BOT_TOKEN:
+        missing_vars.append("SLACK_BOT_TOKEN")
+    if not SLACK_CHANNEL:
+        missing_vars.append("SLACK_CHANNEL")
+
+    if missing_vars:
+        print(f"Error: The following environment variables are missing in your .env file: {', '.join(missing_vars)}")
+        print("Exiting due to missing configuration.")
     else:
-        feeds = read_feeds_from_yaml('news-aggregator/feeds.yaml')
-        context = read_context('news-aggregator/context.txt')
-        if not feeds:
-            print("No feeds found in feeds.yaml. Please add some RSS feed URLs.")
-        elif not context:
-            print("Context is empty. Please add content to context.txt.")
+        print("All environment variables loaded successfully.")
+        
+        # 2. Initialize Vertex AI
+        model = initialize_vertex_ai()
+        if not model:
+            print("Exiting because AI model failed to initialize.")
         else:
-            search_news(feeds, context)
+            # 3. Read feed and context files
+            feeds = read_feeds_from_yaml('feeds.yaml')
+            context = read_context('context.txt')
+            
+            if not feeds or not context:
+                print("Error: feeds.yaml or context.txt file is empty. Exiting.")
+            else:
+                # 4. Run the main process
+                found_articles = search_news(model, feeds, context)
+                if found_articles:
+                    post_news_to_slack(found_articles, SLACK_CHANNEL)
+                else:
+                    print("No new relevant news found to post to Slack.")
