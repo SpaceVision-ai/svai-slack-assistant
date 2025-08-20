@@ -9,6 +9,8 @@ from slack_bolt.adapter.socket_mode import SocketModeHandler
 import vertexai
 from vertexai.generative_models import GenerativeModel
 import notion_client
+import requests
+from bs4 import BeautifulSoup
 
 # .env 파일 (봇 특정 및 공통) 로드
 load_dotenv() # 현재 디렉터리의 .env 로드
@@ -108,7 +110,7 @@ def handle_member_joined_channel(event, say, logger):
         try:
             say(
                 channel=channel_id,
-                text="Hello! I've been invited to this direct message channel and will now automatically translate messages. No extra commands needed!"
+                text="Hello! I\'ve been invited to this direct message channel and will now automatically translate messages. No extra commands needed!"
             )
             logger.info(f"Joined and sent welcome message to mpim channel: {channel_id}")
         except Exception as e:
@@ -136,19 +138,9 @@ def should_translate(event):
         channel_type = event.get('channel_type')
         return channel_manager.is_channel_registered(channel_id) or channel_type in ['im', 'mpim']
 
-    # 3. If no plain text, check if any of the URLs are from Notion or Slack
+    # 3. If no plain text, but there are URLs, we might need to process them.
     all_urls_found = re.findall(bracketed_url_pattern, text) + re.findall(plain_url_pattern, text)
-    
-    has_special_link = False
-    for url in all_urls_found:
-        # Extract the actual URL from formats like <url|text>
-        clean_url = url.strip('<>').split('|')[0]
-        if 'notion.so' in clean_url or 'notion.site' in clean_url or 'slack.com' in clean_url:
-            has_special_link = True
-            break
-    
-    # If a special link is found, proceed with translation
-    if has_special_link:
+    if all_urls_found:
         channel_id = event.get('channel')
         channel_type = event.get('channel_type')
         return channel_manager.is_channel_registered(channel_id) or channel_type in ['im', 'mpim']
@@ -195,12 +187,6 @@ def fetch_slack_permalink_content(url, client, logger):
         if "not_in_channel" in str(e):
              return "[Warning: Could not fetch the linked message because I am not in that channel.]"
         return "[Warning: An error occurred while fetching the linked message.]"
-
-
-
-
-
-
 
 def ask_to_translate_title(say, channel, ts, page_id, original_title, new_title, title_prop_name, notion_url):
     """Asks the user if they want to translate the Notion document title."""
@@ -358,7 +344,7 @@ def handle_translate_notion(ack, command, say, logger):
 
     page_id = get_page_id_from_url(url)
     if not page_id:
-        say(text="I couldn't find a valid Page ID in that URL. Please check the link and try again.")
+        say(text="I couldn\'t find a valid Page ID in that URL. Please check the link and try again.")
         return
 
     thinking_message = say(text=f":hourglass_flowing_sand: Translating Notion page: <{url}>. This might take a moment...")
@@ -494,13 +480,92 @@ def handle_translate_notion(ack, command, say, logger):
         error_message = f":warning: An unexpected error occurred: ```{e}```"
         app.client.chat_update(channel=command['channel_id'], ts=thinking_message['ts'], text=error_message)
 
+def create_url_summary_blocks(clean_url, logger):
+    """
+    Fetches a URL, summarizes its content, translates the summary, and returns Slack blocks.
+    Returns None if any step fails.
+    """
+    try:
+        # 1. 웹페이지 콘텐츠 추출
+        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/58.0.3029.110 Safari/537.3'}
+        response = requests.get(clean_url, headers=headers, timeout=10)
+        response.raise_for_status()
+        soup = BeautifulSoup(response.content, 'html.parser')
+
+        # OG:Image URL 추출
+        og_image_url = None
+        og_image_tag = soup.find('meta', property='og:image')
+        if og_image_tag and og_image_tag.get('content'):
+            og_image_url = og_image_tag['content']
+            logger.info(f"Found og:image for {clean_url}: {og_image_url}")
+
+        page_text = soup.get_text(separator='\n', strip=True)
+        
+        # 2. 텍스트 요약
+        summarization_prompt = f"""Please summarize the following article text in its original language. Focus on the main points and key information, and keep the summary concise, within 350 characters.
+
+Article Text:
+{page_text[:4000]}
+"""
+        summary_response = model.generate_content(summarization_prompt)
+        summary_text = summary_response.text.strip()
+
+        # 3. 요약문 번역
+        translation_prompt = f"""You are a professional translator. Detect the language of the following text and translate it.
+- If it is Korean, translate it to English.
+- For all other languages, translate it to Korean.
+- Provide only the raw, translated text.
+
+Text to translate:
+{summary_text}
+"""
+        translated_summary = model.generate_content(translation_prompt).text.strip()
+        
+        # 4. 블록 키트 메시지 구성
+        blocks = [
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": f"🌐 *Summary & Translation for <{clean_url}>*: "
+                }
+            }
+        ]
+
+        if og_image_url:
+            blocks.append({
+                "type": "context",
+                "elements": [
+                    {
+                        "type": "mrkdwn",
+                        "text": f"🖼️ Preview Image URL: {og_image_url}"
+                    }
+                ]
+            })
+
+        blocks.append({
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": translated_summary
+            }
+        })
+        
+        return blocks
+
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Error fetching URL {clean_url}: {e}")
+        return [{"type": "section", "text": {"type": "mrkdwn", "text": f":warning: Sorry, I couldn\'t fetch the content from <{clean_url}>."}}]
+    except Exception as e:
+        logger.error(f"Error summarizing/translating URL {clean_url}: {e}")
+        return [{"type": "section", "text": {"type": "mrkdwn", "text": f":warning: Sorry, I couldn\'t summarize or translate the page at <{clean_url}>. Error: {e}"}}] 
+
 
 def translate_message(event, say, client, logger):
-
-
     """
     메시지를 번역하고 올바른 위치(채널 또는 스레드)에 게시합니다.
-    Notion 또는 Slack 링크가 포함된 경우, 해당 내용을 가져와 함께 번역합니다.
+    - 일반 텍스트가 포함된 경우: 텍스트를 번역하고, 포함된 URL(일반)은 요약/번역합니다.
+    - URL만 포함된 경우: 각 URL을 요약/번역합니다.
     """
     channel_id = event.get('channel')
     user_id = event.get('user')
@@ -509,58 +574,55 @@ def translate_message(event, say, client, logger):
     thread_ts_from_event = event.get('thread_ts')
     channel_type = event.get('channel_type')
 
-    # 1. 번역 메시지를 보낼 스레드를 결정합니다.
-    translation_thread_ts = None
-    if channel_type not in ['im', 'mpim']:  # 공개/비공개 채널인 경우
-        translation_thread_ts = thread_ts_from_event or original_ts
-    # DM/MPIM인 경우, None으로 유지하여 새 메시지로 보냅니다.
-
+    translation_thread_ts = thread_ts_from_event or original_ts
     thinking_response = None
+
     try:
-        # 2. 모든 사용자에게 보이는 "생각 중" 메시지를 보냅니다.
-        thinking_messages = [
-            "Interpreting Heptapod Language…", "Translating to Mentalese…",
-            "Analyzing linguistic patterns…", "Connecting to the universal translator…"
-        ]
-        thinking_message_text = random.choice(thinking_messages)
+        # 1. URL 패턴 정의 및 메시지에서 URL 찾기
+        mention_pattern = r"<@\w+>"
+        bracketed_url_pattern = r"<https?://[^>]+>"
+        plain_url_pattern = r"https?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\\(\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+"
         
-        thinking_response = say(
-            text=f":thought_balloon: {thinking_message_text}",
-            thread_ts=translation_thread_ts
-        )
+        bracketed_urls = re.findall(bracketed_url_pattern, text)
+        text_without_bracketed = re.sub(bracketed_url_pattern, '', text)
+        plain_urls = re.findall(plain_url_pattern, text_without_bracketed)
+        urls_in_message = bracketed_urls + plain_urls
 
-        # 3. URL을 placeholder로 바꾸고, 링크된 콘텐츠를 가져옵니다.
-        url_pattern = r"http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\(\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+"
-        urls = []
-        linked_content_for_translation = []
-        warnings_to_post_as_reply = []
+        text_without_special_elements = re.sub(mention_pattern, '', text_without_bracketed)
+        text_without_special_elements = re.sub(plain_url_pattern, '', text_without_special_elements)
 
-        def replace_url(match):
-            url = match.group(0)
-            urls.append(url)
-            placeholder = f"__URL_PLACEHOLDER_{len(urls)-1}__"
+        # CASE A: 일반 텍스트가 포함된 경우
+        if text_without_special_elements.strip():
+            thinking_response = say(text=":thought_balloon: Translating text...", thread_ts=translation_thread_ts)
             
-            # 슬랙 링크 내용 가져오기
-            content = fetch_slack_permalink_content(url, client, logger)
-            if content:
-                if content.startswith("[Warning:"):
-                    if "not in that channel" in content:
-                        warning_message = f"I tried to translate the message at <{url}> as well, but I couldn't access it because I'm not invited to that channel. 😢"
-                        warnings_to_post_as_reply.append(warning_message)
-                else:
-                    linked_content_for_translation.append(content)
-            return placeholder
-        
-        text_with_placeholders = re.sub(url_pattern, replace_url, text)
+            linked_content_for_translation = []
+            warnings_to_post_as_reply = []
+            placeholders = {}
 
-        # 인용된 내용과 원본 텍스트를 결합 (원본이 위로)
-        full_text_to_translate = text_with_placeholders
-        if linked_content_for_translation:
-            quoted_section = "\n".join(linked_content_for_translation)
-            full_text_to_translate = f"{text_with_placeholders}\n\n\nFrom Slack Link:\n{quoted_section}\n"
+            def replace_url_for_text_translation(match):
+                url = match.group(0)
+                placeholder = f"__URL_PLACEHOLDER_{len(placeholders)}__"
+                placeholders[placeholder] = url
+                
+                if "slack.com" in url:
+                    content = fetch_slack_permalink_content(url, client, logger)
+                    if content:
+                        if content.startswith("[Warning:"):
+                            if "not in that channel" in content:
+                                warnings_to_post_as_reply.append(f"I tried to translate the message at <{url}> as well, but I couldn\'t access it because I\'m not invited to that channel. 😢")
+                        else:
+                            linked_content_for_translation.append(content)
+                return placeholder
 
-        # 4. 번역을 수행합니다.
-        if re.sub(r'__URL_PLACEHOLDER_\d+__', '', full_text_to_translate).strip():
+            # URL을 Placeholder로 교체 (순서 중요: bracketed -> plain)
+            text_with_placeholders = re.sub(bracketed_url_pattern, replace_url_for_text_translation, text)
+            text_with_placeholders = re.sub(plain_url_pattern, replace_url_for_text_translation, text_with_placeholders)
+
+            full_text_to_translate = text_with_placeholders
+            if linked_content_for_translation:
+                quoted_section = "\n".join(linked_content_for_translation)
+                full_text_to_translate = f"{text_with_placeholders}\n\n\nFrom Slack Link:\n{quoted_section}\n"
+
             prompt = f"""You are a professional translator. Your task is to translate the given text, including any quoted sections. 
 - Detect the language of the text.
 - If it is Korean, translate it to English.
@@ -572,113 +634,57 @@ def translate_message(event, say, client, logger):
 Text to translate:
 {full_text_to_translate}
 """
-            
             translation_response = model.generate_content(prompt)
             translated_text_with_placeholders = translation_response.text.strip()
 
             final_translated_text = translated_text_with_placeholders
-            for i, url in enumerate(urls):
-                final_translated_text = final_translated_text.replace(f"__URL_PLACEHOLDER_{i}__", url)
-        else:
-            final_translated_text = ' '.join(urls)
+            for placeholder, url in placeholders.items():
+                final_translated_text = final_translated_text.replace(placeholder, f"<{url.strip('<>')}>")
+            
+            is_korean = any(c >= '가' and c <= '힣' for c in text)
+            reply_text = f"🌐 Translation (EN) from <@{user_id}>: {final_translated_text}" if is_korean else f"🌐 번역 (KR) from <@{user_id}>: {final_translated_text}"
+            
+            app.client.chat_update(channel=channel_id, ts=thinking_response['ts'], text=reply_text, unfurl_links=False)
+            
+            for warning in warnings_to_post_as_reply:
+                say(channel=channel_id, text=warning, thread_ts=translation_thread_ts)
 
-        is_korean = any(c >= '가' and c <= '힣' for c in text)
-        if is_korean:
-            reply_text = f"🌐 Translation (EN) from <@{user_id}>: {final_translated_text}"
-        else:
-            reply_text = f"🌐 번역 (KR) from <@{user_id}>: {final_translated_text}"
-
-        # 5. "생각 중" 메시지를 최종 번역 결과로 업데이트합니다.
-        app.client.chat_update(
-            channel=channel_id,
-            ts=thinking_response['ts'],
-            text=reply_text
-        )
+        # 후속 조치: 모든 경우에 대해 일반/Notion URL 처리
+        thread_for_follow_ups = translation_thread_ts or (thinking_response and thinking_response.get('ts')) or original_ts
         
-        # 7. 후속 조치(경고, Notion 제안)를 위한 스레드를 결정하고 실행합니다.
-        thread_for_follow_ups = None
-        if channel_type not in ['im', 'mpim']: # 채널
-            thread_for_follow_ups = translation_thread_ts
-        else: # DM/MPIM
-            thread_for_follow_ups = thinking_response['ts']
-
-        # 슬랙 링크 경고 메시지 전송
-        for warning in warnings_to_post_as_reply:
-            say(channel=channel_id, text=warning, thread_ts=thread_for_follow_ups)
-
-        # Notion 링크 확인 및 처리
-        logger.info(f"Found URLs for Notion processing: {urls}")
-        for url in urls:
-            if 'notion.so' in url or 'notion.site' in url:
-                page_id = get_page_id_from_url(url)
-                logger.info(f"Processing Notion URL: {url}, Extracted Page ID: {page_id}")
+        for url in urls_in_message:
+            clean_url = url.strip('<>').split('|')[0]
+            
+            if 'notion.so' in clean_url or 'notion.site' in clean_url:
+                # Notion 링크 처리
+                page_id = get_page_id_from_url(clean_url)
                 if page_id:
                     try:
                         page = notion.pages.retrieve(page_id=page_id)
-                        
                         properties = page.get('properties', {})
-                        title_property = None
-                        title_prop_name = None
+                        title_property, title_prop_name = None, None
                         for prop_name, prop_details in properties.items():
                             if prop_details.get('type') == 'title':
-                                title_property = prop_details
-                                title_prop_name = prop_name
+                                title_property, title_prop_name = prop_details, prop_name
                                 break
                         
                         if title_property and title_prop_name:
                             original_title = title_property.get('title', [{}])[0].get('plain_text', 'Untitled')
-                            logger.info(f"Page Title for {page_id}: '{original_title}'")
-                            
-                            # --- New logic to check if a title should be translated ---
-                            
-                            # A title should be translated if it contains Korean but does not appear to be bilingually formatted.
-                            is_candidate = re.search(r'[가-힣]', original_title)
-                            is_bilingual_formatted = False
-
-                            # Check for bilingual patterns only if both languages are present.
-                            if is_candidate and re.search(r'[a-zA-Z]', original_title):
-                                # Pattern 1: Contains a slash, indicating format like "Korean / English"
-                                if '/' in original_title:
-                                    is_bilingual_formatted = True
-                                
-                                # Pattern 2: Contains parentheses, indicating format like "Korean (English)"
-                                if re.search(r'\s*\([^)]+\)', original_title):
-                                    is_bilingual_formatted = True
-
-                            logger.info(f"Title check for {page_id}: Is candidate? {bool(is_candidate)}, Is bilingual formatted? {is_bilingual_formatted}")
-
-                            if is_candidate and not is_bilingual_formatted:
-                                logger.info(f"Condition met for {page_id}, proceeding with translation.")
+                            is_candidate = re.search(r'[가-힣]', original_title) and not (re.search(r'[a-zA-Z]', original_title) and ('/' in original_title or re.search(r'\s*\([^)]+\)', original_title)))
+                            if is_candidate:
                                 prompt = f"Translate the following Korean document title to English. Respond with only the translated title, without any additional text or quotation marks. Title: '{original_title}'"
                                 title_translation_response = model.generate_content(prompt)
                                 english_title = title_translation_response.text.strip()
                                 new_title_format = f"{original_title} ({english_title})"
-                                
-                                ask_to_translate_title(say, channel_id, thread_for_follow_ups, page_id, original_title, new_title_format, title_prop_name, url)
-                            else:
-                                logger.info(f"Skipping translation suggestion for {page_id} as conditions were not met.")
-                        else:
-                            logger.warning(f"Could not find a title property for page ID: {page_id}")
-
-                    except notion_client.errors.APIResponseError as e:
-                        if e.code == "object_not_found":
-                            error_message_kr = (
-                                f":warning: <{url}|Notion 페이지>에 접근할 수 없습니다. "
-                                "페이지가 존재하지 않거나, 저에게 접근 권한이 없는 것 같아요."
-                            )
-                            error_message_en = (
-                                f":warning: I can't access that <{url}|Notion page>. "
-                                "It might not exist, or I may not have permission."
-                            )
-                            say(channel=channel_id, thread_ts=thread_for_follow_ups, text=f"{error_message_kr}\n\n{error_message_en}")
-                        else:
-                            logger.error(f"Notion API Error for url {url}: {e}")
-                            say(channel=channel_id, thread_ts=thread_for_follow_ups, text=f":warning: An error occurred with the Notion API for <{url}>: ```{e}```")
+                                ask_to_translate_title(say, channel_id, thread_for_follow_ups, page_id, original_title, new_title_format, title_prop_name, clean_url)
                     except Exception as e:
-                        logger.error(f"An unexpected error occurred while handling Notion link {url}: {e}")
-                        say(channel=channel_id, thread_ts=thread_for_follow_ups, text=f":warning: An unexpected error occurred while processing the Notion link <{url}>: ```{e}```")
-                else:
-                    logger.info(f"No page ID found for URL: {url}")
+                        logger.error(f"Error processing Notion link {clean_url}: {e}")
+
+            elif 'slack.com' not in clean_url:
+                # 일반 URL 요약/번역
+                summary_blocks = create_url_summary_blocks(clean_url, logger)
+                if summary_blocks:
+                    say(channel=channel_id, thread_ts=thread_for_follow_ups, blocks=summary_blocks, unfurl_links=False)
 
     except Exception as e:
         logger.error(f"Error during translation process: {e}")
@@ -692,11 +698,6 @@ Text to translate:
             say(text=f"Sorry, an error occurred during translation: {e}")
 
 
-
-
-
-
-
 @app.event("message")
 def handle_message_events(body, say, client, logger):
     event = body.get('event', {})
@@ -704,8 +705,7 @@ def handle_message_events(body, say, client, logger):
     if event.get("bot_id"):
         return
     
-    # is_bot_id = event.get("message", {}).get("bot_id") or event.get("message", {}).get("attachments", [{}])[0].get("bot_id")
-    if event.get("subtype") == "message_changed": #and is_bot_id:
+    if event.get("subtype") == "message_changed":
         logger.info(">>> skip because the message is made by bot")
         return
     # --- End of Check ---
@@ -715,19 +715,6 @@ def handle_message_events(body, say, client, logger):
         if should_translate(event_data):
             translate_message(event_data, say, client, logger)
 
-    # if event.get("subtype") == "message_changed":
-    #     message = event.get("message", {})
-    #     if message.get("user"):
-    #         event_for_translation = {
-    #             "channel": event.get("channel"),
-    #             "channel_type": event.get("channel_type"),
-    #             "user": message.get("user"),
-    #             "text": message.get("text"),
-    #             "ts": message.get("ts"),
-    #             "thread_ts": event.get("thread_ts", message.get("ts")),
-    #         }
-    #         process_event(event_for_translation)
-    # else:
     process_event(event)
 
 if __name__ == "__main__":
