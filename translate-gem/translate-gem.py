@@ -3,6 +3,7 @@ import logging
 import json
 import random
 import re
+from urllib.parse import urljoin
 from dotenv import load_dotenv
 from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
@@ -487,6 +488,61 @@ def handle_translate_notion(ack, command, say, logger):
         error_message = f":warning: An unexpected error occurred: ```{e}```"
         app.client.chat_update(channel=command['channel_id'], ts=thinking_message['ts'], text=error_message)
 
+def analyze_image_from_url(image_url, logger, headers=None):
+    """
+    Downloads an image from a URL, analyzes it with Gemini, and returns the analysis.
+    Returns the analysis text or an error string.
+    """
+    logger.info(f"Analyzing image from URL: {image_url}")
+    try:
+        response = requests.get(image_url, headers=headers or {}, timeout=20)
+        response.raise_for_status()
+
+        content_type = response.headers.get('Content-Type', '')
+        if not content_type.startswith('image/'):
+            logger.warning(f"URL did not return an image. Content-Type: {content_type}")
+            return f":warning: The link ({image_url}) did not lead to a direct image file."
+
+        image_data = response.content
+        
+        image_part = Part.from_data(data=image_data, mime_type=content_type)
+        
+        prompt = """You are a visual translation expert. Your task is to analyze the provided image and perform the following tasks:
+1. Identify all distinct pieces of text in the image.
+2. For each piece of text, describe its approximate location (e.g., 'top center', 'bottom left banner').
+3. Provide the original text you identified.
+4. Translate the text. If it's Korean, translate to English. For all other languages, translate to Korean.
+5. Present the result as a Slack message using markdown. If no text is found, state that clearly.
+
+Example Output:
+---
+*Image Text Analysis & Translation*
+
+*Location:* Top-left corner
+> *Original:* 안녕하세요
+> *Translation:* Hello
+
+*Location:* Bottom, inside a blue button
+> *Original:* Click Here
+> *Translation:* 여기를 클릭하세요
+---
+"""
+        
+        response = model.generate_content([image_part, prompt])
+        analysis_text = response.text.strip()
+
+        if not analysis_text:
+            return "I analyzed the image but could not find any text to translate."
+        
+        return analysis_text
+
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Failed to download image from {image_url}: {e}")
+        return f":warning: Could not download the image from the link to analyze it."
+    except Exception as e:
+        logger.error(f"Error analyzing image from {image_url} with Gemini: {e}")
+        return f":warning: An error occurred while analyzing the image from the link."
+
 def create_url_summary_blocks(clean_url, logger):
     """
     Fetches a URL, summarizes its content, translates the summary, and returns Slack blocks.
@@ -512,8 +568,7 @@ def create_url_summary_blocks(clean_url, logger):
         summarization_prompt = f'''Please summarize the following article text in its original language. Focus on the main points and key information, and keep the summary concise, within 350 characters.
 
 Article Text:
-{page_text[:4000]} 
-'''
+{page_text[:4000]}\n'''
         summary_response = model.generate_content(summarization_prompt)
         summary_text = summary_response.text.strip()
 
@@ -536,27 +591,29 @@ Text to translate:
                     "type": "mrkdwn",
                     "text": f"🌐 *Summary & Translation for <{clean_url}>*: "
                 }
+            },
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": translated_summary
+                }
             }
         ]
 
+        # 5. OG:Image가 있으면 분석하고 결과 추가
         if og_image_url:
+            absolute_og_image_url = urljoin(clean_url, og_image_url)
+            image_analysis_text = analyze_image_from_url(absolute_og_image_url, logger)
+            
+            blocks.append({"type": "divider"})
             blocks.append({
-                "type": "context",
-                "elements": [
-                    {
-                        "type": "mrkdwn",
-                        "text": f"🖼️ Preview Image URL: {og_image_url}"
-                    }
-                ]
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": f"🖼️ *Image Analysis for* <{absolute_og_image_url}|og:image>:\n{image_analysis_text}"
+                }
             })
-
-        blocks.append({
-            "type": "section",
-            "text": {
-                "type": "mrkdwn",
-                "text": translated_summary
-            }
-        })
         
         return blocks
 
@@ -592,78 +649,14 @@ def handle_image_translation(file_obj, channel_id, thread_ts, say, logger, clien
         return
 
     headers = {'Authorization': f'Bearer {os.environ.get("SLACK_BOT_TOKEN")}'}
-    try:
-        response = requests.get(url, headers=headers, timeout=20)
-        response.raise_for_status()
+    analysis_result = analyze_image_from_url(url, logger, headers=headers)
 
-        content_type = response.headers.get('Content-Type', '')
-        if not content_type.startswith('image/'):
-            logger.error(f"Downloaded file is not an image. Content-Type: {content_type}")
-            logger.error(f"Received HTML instead of image. This is often a permission issue. Please ensure the bot has the 'files:read' scope.")
-            app.client.chat_update(
-                channel=channel_id,
-                ts=thinking_message['ts'],
-                text=":warning: Failed to download the image. Instead of the image, I received a webpage. This usually means I don't have the right permissions. Please make sure the bot has the `files:read` permission."
-            )
-            return
-
-        image_data = response.content
-        logger.info(f"Image downloaded. MIME Type from Slack: {mimetype}, Response Content-Type: {content_type}, Size: {len(image_data)} bytes.")
-        logger.info(f"First 16 bytes of image data: {image_data[:16]}")
-    except requests.exceptions.RequestException as e:
-        logger.error(f"Failed to download image: {e}")
-        app.client.chat_update(
-            channel=channel_id,
-            ts=thinking_message['ts'],
-            text=f":warning: Sorry, I couldn\'t download the image to analyze it. Error: `{e}`"
-        )
-        return
-
-    try:
-        image_part = Part.from_data(data=image_data, mime_type=mimetype)
-
-        prompt = """You are a visual translation expert. Your task is to analyze the provided image and perform the following tasks:
-1. Identify all distinct pieces of text in the image.
-2. For each piece of text, describe its approximate location (e.g., 'top center', 'bottom left banner').
-3. Provide the original text you identified.
-4. Translate the text. If it's Korean, translate to English. For all other languages, translate to Korean.
-5. Present the result as a Slack message using markdown. If no text is found, state that clearly.
-
-Example Output:
----
-*Image Text Analysis & Translation*
-
-*Location:* Top-left corner
-> *Original:* 안녕하세요
-> *Translation:* Hello
-
-*Location:* Bottom, inside a blue button
-> *Original:* Click Here
-> *Translation:* 여기를 클릭하세요
----
-"""
-        
-        response = model.generate_content([image_part, prompt])
-        translated_description = response.text.strip()
-
-        if not translated_description:
-             translated_description = "I analyzed the image but could not find any text to translate."
-
-        app.client.chat_update(
-            channel=channel_id,
-            ts=thinking_message['ts'],
-            text=translated_description
-        )
-        logger.info(f"Successfully posted image translation for {file_obj.get('name')}")
-
-    except Exception as e:
-        logger.error(f"Error analyzing image with Gemini: {e}")
-        app.client.chat_update(
-            channel=channel_id,
-            ts=thinking_message['ts'],
-            text=f":warning: Sorry, an error occurred while analyzing the image with the AI model: `{e}`"
-        )
-
+    app.client.chat_update(
+        channel=channel_id,
+        ts=thinking_message['ts'],
+        text=analysis_result
+    )
+    logger.info(f"Successfully posted image translation for {file_obj.get('name')}")
 
 def translate_message(event, say, client, logger):
     """
@@ -683,7 +676,7 @@ def translate_message(event, say, client, logger):
         # 1. URL 패턴 정의 및 메시지에서 URL 찾기
         mention_pattern = r"<@\w+>"
         bracketed_url_pattern = r"<https?://[^>]+>"
-        plain_url_pattern = r"https?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\\(\\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+"
+        plain_url_pattern = r"https?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\\(\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+"
         
         bracketed_urls = re.findall(bracketed_url_pattern, text)
         text_without_bracketed = re.sub(bracketed_url_pattern, '', text)
