@@ -23,6 +23,14 @@ logger = logging.getLogger(__name__)
 # Slack 앱 초기화
 app = App(token=os.environ.get("SLACK_BOT_TOKEN"))
 
+# 봇 자신의 ID 조회
+try:
+    BOT_ID = app.client.auth_test()["bot_id"]
+    logger.info(f"Initialized with BOT_ID: {BOT_ID}")
+except Exception as e:
+    logger.error(f"Error getting bot ID: {e}")
+    BOT_ID = None
+
 # Vertex AI 초기화
 vertexai.init(project=os.environ.get("GOOGLE_CLOUD_PROJECT"), location=os.environ.get("GOOGLE_CLOUD_LOCATION"))
 model = GenerativeModel("gemini-2.5-flash")
@@ -69,6 +77,32 @@ class ChannelManager:
 
 channel_manager = ChannelManager()
 
+class BotThreadMapper:
+    def __init__(self, file_path='bot_threads.json'):
+        self.file_path = file_path
+        self.mappings = self._load_mappings()
+
+    def _load_mappings(self):
+        try:
+            with open(self.file_path, 'r') as f:
+                return json.load(f)
+        except FileNotFoundError:
+            return {}
+
+    def _save_mappings(self):
+        with open(self.file_path, 'w') as f:
+            json.dump(self.mappings, f, indent=4)
+
+    def add_mapping(self, original_ts, translated_ts):
+        self.mappings[original_ts] = translated_ts
+        self._save_mappings()
+
+    def get_translated_thread_ts(self, original_ts):
+        return self.mappings.get(original_ts)
+
+bot_thread_mapper = BotThreadMapper()
+
+
 @app.command("/translate-gem-channel")
 def handle_translate_command(ack, command, logger):
     subcommand = command.get('text', '').strip().lower()
@@ -89,7 +123,7 @@ def handle_translate_command(ack, command, logger):
         elif subcommand == 'list':
             registered_channels = channel_manager.get_channels()
             if registered_channels:
-                channel_links = [f"<#{c}>" for c in registered_channels]
+                channel_links = [f"<#{c}>") for c in registered_channels]
                 response_text = f"Real-time translation is currently active in the following channels: {', '.join(channel_links)}"
             else:
                 response_text = "Real-time translation is not active in any channels."
@@ -119,34 +153,7 @@ def handle_member_joined_channel(event, say, logger):
 def should_translate(event):
     """Determine if a message should be translated."""
     text = event.get('text', '')
-    if not text:
-        return False
-
-    # 1. Define patterns for special elements
-    bracketed_url_pattern = r"<https?://[^>]+>"
-    plain_url_pattern = r"https?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\(\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+"
-    mention_pattern = r"<@\w+>"
-
-    # 2. Check for the presence of normal text
-    text_without_special_elements = re.sub(bracketed_url_pattern, '', text)
-    text_without_special_elements = re.sub(plain_url_pattern, '', text_without_special_elements)
-    text_without_special_elements = re.sub(mention_pattern, '', text_without_special_elements)
-
-    # If there is any plain text, proceed with translation
-    if text_without_special_elements.strip():
-        channel_id = event.get('channel')
-        channel_type = event.get('channel_type')
-        return channel_manager.is_channel_registered(channel_id) or channel_type in ['im', 'mpim']
-
-    # 3. If no plain text, but there are URLs, we might need to process them.
-    all_urls_found = re.findall(bracketed_url_pattern, text) + re.findall(plain_url_pattern, text)
-    if all_urls_found:
-        channel_id = event.get('channel')
-        channel_type = event.get('channel_type')
-        return channel_manager.is_channel_registered(channel_id) or channel_type in ['im', 'mpim']
-
-    # Otherwise, do not translate
-    return False
+    return bool(text)
 
 
 def get_page_id_from_url(url):
@@ -315,7 +322,7 @@ def translate_text_chunk(text, target_language, logger):
         return text
 
     source_language = "Korean" if target_language == "English" else "another language (e.g., English)"
-    prompt = f"""You are a professional translator. Your task is to translate the text provided inside the <translate> XML tags.
+    prompt = f'''You are a professional translator. Your task is to translate the text provided inside the <translate> XML tags.
 - The source language is {source_language}.
 - Translate it to {target_language}.
 - Preserve all original line breaks and spacing.
@@ -324,7 +331,7 @@ def translate_text_chunk(text, target_language, logger):
 <translate>
 {text}
 </translate>
-"""
+'''
     try:
         response = model.generate_content(prompt)
         return response.text.strip()
@@ -502,23 +509,23 @@ def create_url_summary_blocks(clean_url, logger):
         page_text = soup.get_text(separator='\n', strip=True)
         
         # 2. 텍스트 요약
-        summarization_prompt = f"""Please summarize the following article text in its original language. Focus on the main points and key information, and keep the summary concise, within 350 characters.
+        summarization_prompt = f'''Please summarize the following article text in its original language. Focus on the main points and key information, and keep the summary concise, within 350 characters.
 
 Article Text:
-{page_text[:4000]}
-"""
+{page_text[:4000]} 
+'''
         summary_response = model.generate_content(summarization_prompt)
         summary_text = summary_response.text.strip()
 
         # 3. 요약문 번역
-        translation_prompt = f"""You are a professional translator. Detect the language of the following text and translate it.
+        translation_prompt = f'''You are a professional translator. Detect the language of the following text and translate it.
 - If it is Korean, translate it to English.
 - For all other languages, translate it to Korean.
 - Provide only the raw, translated text.
 
 Text to translate:
 {summary_text}
-"""
+'''
         translated_summary = model.generate_content(translation_prompt).text.strip()
         
         # 4. 블록 키트 메시지 구성
@@ -563,16 +570,14 @@ Text to translate:
 
 def translate_message(event, say, client, logger):
     """
-    메시지를 번역하고 올바른 위치(채널 또는 스레드)에 게시합니다.
-    - 일반 텍스트가 포함된 경우: 텍스트를 번역하고, 포함된 URL(일반)은 요약/번역합니다.
-    - URL만 포함된 경우: 각 URL을 요약/번역합니다.
+    Translates a message from a user and posts the translation in a thread.
+    If the message contains URLs, it also summarizes and translates them.
     """
     channel_id = event.get('channel')
     user_id = event.get('user')
     text = event.get('text')
     original_ts = event.get('ts')
     thread_ts_from_event = event.get('thread_ts')
-    channel_type = event.get('channel_type')
 
     translation_thread_ts = thread_ts_from_event or original_ts
     thinking_response = None
@@ -581,7 +586,7 @@ def translate_message(event, say, client, logger):
         # 1. URL 패턴 정의 및 메시지에서 URL 찾기
         mention_pattern = r"<@\w+>"
         bracketed_url_pattern = r"<https?://[^>]+>"
-        plain_url_pattern = r"https?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\\(\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+"
+        plain_url_pattern = r"https?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\\(\\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+"
         
         bracketed_urls = re.findall(bracketed_url_pattern, text)
         text_without_bracketed = re.sub(bracketed_url_pattern, '', text)
@@ -614,7 +619,6 @@ def translate_message(event, say, client, logger):
                             linked_content_for_translation.append(content)
                 return placeholder
 
-            # URL을 Placeholder로 교체 (순서 중요: bracketed -> plain)
             text_with_placeholders = re.sub(bracketed_url_pattern, replace_url_for_text_translation, text)
             text_with_placeholders = re.sub(plain_url_pattern, replace_url_for_text_translation, text_with_placeholders)
 
@@ -623,7 +627,7 @@ def translate_message(event, say, client, logger):
                 quoted_section = "\n".join(linked_content_for_translation)
                 full_text_to_translate = f"{text_with_placeholders}\n\n\nFrom Slack Link:\n{quoted_section}\n"
 
-            prompt = f"""You are a professional translator. Your task is to translate the given text, including any quoted sections. 
+            prompt = f'''You are a professional translator. Your task is to translate the given text, including any quoted sections. 
 - Detect the language of the text.
 - If it is Korean, translate it to English.
 - For all other languages, translate it to Korean.
@@ -633,7 +637,7 @@ def translate_message(event, say, client, logger):
 
 Text to translate:
 {full_text_to_translate}
-"""
+'''
             translation_response = model.generate_content(prompt)
             translated_text_with_placeholders = translation_response.text.strip()
 
@@ -656,7 +660,6 @@ Text to translate:
             clean_url = url.strip('<>').split('|')[0]
             
             if 'notion.so' in clean_url or 'notion.site' in clean_url:
-                # Notion 링크 처리
                 page_id = get_page_id_from_url(clean_url)
                 if page_id:
                     try:
@@ -681,7 +684,6 @@ Text to translate:
                         logger.error(f"Error processing Notion link {clean_url}: {e}")
 
             elif 'slack.com' not in clean_url:
-                # 일반 URL 요약/번역
                 summary_blocks = create_url_summary_blocks(clean_url, logger)
                 if summary_blocks:
                     say(channel=channel_id, thread_ts=thread_for_follow_ups, blocks=summary_blocks, unfurl_links=False)
@@ -697,25 +699,76 @@ Text to translate:
         else:
             say(text=f"Sorry, an error occurred during translation: {e}")
 
+def translate_bot_message_structure(event, say, logger):
+    """
+    Translates a message from another bot, preserving the thread structure.
+    """
+    channel_id = event.get('channel')
+    original_ts = event.get('ts')
+    thread_ts = event.get('thread_ts')
+    text = event.get('text', '')
+
+    if not text.strip():
+        return
+
+    prompt = f'''You are a professional translator. Your task is to translate the given text.
+- Detect the language of the text.
+- If it is Korean, translate it to English.
+- For all other languages, translate it to Korean.
+- Provide only the raw, translated text.
+
+Text to translate:
+{text}
+'''
+    try:
+        translated_text = model.generate_content(prompt).text.strip()
+
+        if not thread_ts:  # Main message from a bot
+            result = say(text=translated_text)
+            translated_ts = result.get('ts')
+            if translated_ts:
+                bot_thread_mapper.add_mapping(original_ts, translated_ts)
+                logger.info(f"BOT_TRANSLATION: Created new translated thread. Original: {original_ts}, Translated: {translated_ts}")
+        else:  # Thread reply from a bot
+            translated_thread_ts = bot_thread_mapper.get_translated_thread_ts(thread_ts)
+            if translated_thread_ts:
+                say(text=translated_text, thread_ts=translated_thread_ts)
+                logger.info(f"BOT_TRANSLATION: Replied to translated thread {translated_thread_ts}")
+            else:
+                logger.warning(f"BOT_TRANSLATION: Could not find a mapped translated thread for original thread {thread_ts}")
+    except Exception as e:
+        logger.error(f"Error translating bot message: {e}")
+
 
 @app.event("message")
 def handle_message_events(body, say, client, logger):
     event = body.get('event', {})
-    # --- Robust Bot Message Check ---
-    if event.get("bot_id"):
+    
+    # --- Message Origin Check ---
+    # 1. Ignore messages from this bot itself
+    if event.get("bot_id") == BOT_ID:
         return
     
-    if event.get("subtype") == "message_changed":
-        logger.info(">>> skip because the message is made by bot")
+    # 2. Ignore messages that are not new, like edits or deletions
+    if event.get("subtype") in ["message_changed", "message_deleted"]:
         return
-    # --- End of Check ---
 
-    def process_event(event_data):
-        logger.info(f"--- New User Event Received --- \nTEXT: {event_data.get('text')}")
-        if should_translate(event_data):
-            translate_message(event_data, say, client, logger)
-
-    process_event(event)
+    # --- Routing ---
+    # 3. If the message is from another bot, use the structure-preserving translator
+    if event.get("bot_id"):
+        logger.info(f"--- New Bot Event Received --- \nTEXT: {event.get('text')}")
+        translate_bot_message_structure(event, say, logger)
+    
+    # 4. If the message is from a user, use the standard translator
+    elif event.get("user"):
+        # Check if the channel is registered for translation
+        channel_id = event.get('channel')
+        channel_type = event.get('channel_type')
+        is_registered = channel_manager.is_channel_registered(channel_id) or channel_type in ['im', 'mpim']
+        
+        if is_registered and should_translate(event):
+            logger.info(f"--- New User Event Received --- \nTEXT: {event.get('text')}")
+            translate_message(event, say, client, logger)
 
 if __name__ == "__main__":
     logger.info("Starting bot...")
