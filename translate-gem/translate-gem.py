@@ -123,7 +123,7 @@ def handle_translate_command(ack, command, logger):
         elif subcommand == 'list':
             registered_channels = channel_manager.get_channels()
             if registered_channels:
-                channel_links = [f"<#{c}>") for c in registered_channels]
+                channel_links = [f"<#{c}>" for c in registered_channels]
                 response_text = f"Real-time translation is currently active in the following channels: {', '.join(channel_links)}"
             else:
                 response_text = "Real-time translation is not active in any channels."
@@ -750,12 +750,13 @@ def handle_message_events(body, say, client, logger):
         return
     
     # 2. Ignore messages that are not new, like edits or deletions
-    if event.get("subtype") in ["message_changed", "message_deleted"]:
+    subtype = event.get("subtype")
+    if subtype in ["message_changed", "message_deleted"]:
         return
 
     # --- Routing ---
-    # 3. If the message is from another bot, use the structure-preserving translator
-    if event.get("bot_id"):
+    # 3. If the message is from another bot (has bot_id or is a bot_message subtype)
+    if event.get("bot_id") or subtype == "bot_message":
         logger.info(f"--- New Bot Event Received --- \nTEXT: {event.get('text')}")
         translate_bot_message_structure(event, say, logger)
     
@@ -769,6 +770,7 @@ def handle_message_events(body, say, client, logger):
         if is_registered and should_translate(event):
             logger.info(f"--- New User Event Received --- \nTEXT: {event.get('text')}")
             translate_message(event, say, client, logger)
+
 
 if __name__ == "__main__":
     logger.info("Starting bot...")
