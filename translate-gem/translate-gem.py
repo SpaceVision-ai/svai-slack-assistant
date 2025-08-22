@@ -7,7 +7,7 @@ from dotenv import load_dotenv
 from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
 import vertexai
-from vertexai.generative_models import GenerativeModel
+from vertexai.generative_models import GenerativeModel, Part
 import notion_client
 import requests
 from bs4 import BeautifulSoup
@@ -380,7 +380,7 @@ def handle_translate_notion(ack, command, say, logger):
         logger.info(f"Fetching all blocks for page {page_id}")
         blocks = fetch_all_blocks(page_id, logger)
         if not blocks:
-            app.client.chat_update(channel=command['channel_id'], ts=thinking_message['ts'], text=":warning: The Notion page appears to be empty. There's nothing to translate.")
+            app.client.chat_update(channel=command['channel_id'], ts=thinking_message['ts'], text=":warning: The Notion page appears to be empty. There\'s nothing to translate.")
             return
             
         # 3. Determine translation direction from the first few text blocks
@@ -567,6 +567,103 @@ Text to translate:
         logger.error(f"Error summarizing/translating URL {clean_url}: {e}")
         return [{"type": "section", "text": {"type": "mrkdwn", "text": f":warning: Sorry, I couldn\'t summarize or translate the page at <{clean_url}>. Error: {e}"}}] 
 
+def handle_image_translation(file_obj, channel_id, thread_ts, say, logger, client):
+    """Analyzes an image file, extracts and translates text, and posts the results."""
+    mimetype = file_obj.get('mimetype', '')
+    if not mimetype.startswith('image/'):
+        logger.debug(f"Skipping non-image file: {file_obj.get('name')}")
+        return
+
+    logger.info(f"Detected image file for translation: {file_obj.get('name')} in channel {channel_id}")
+    
+    thinking_message = say(
+        text=f":camera_with_flash: Analyzing image `{file_obj.get('name')}`... this may take a moment.",
+        thread_ts=thread_ts
+    )
+
+    url = file_obj.get('url_private_download')
+    if not url:
+        logger.error("No private download URL found for the image.")
+        app.client.chat_update(
+            channel=channel_id,
+            ts=thinking_message['ts'],
+            text=":warning: Could not translate image. No download URL found."
+        )
+        return
+
+    headers = {'Authorization': f'Bearer {os.environ.get("SLACK_BOT_TOKEN")}'}
+    try:
+        response = requests.get(url, headers=headers, timeout=20)
+        response.raise_for_status()
+
+        content_type = response.headers.get('Content-Type', '')
+        if not content_type.startswith('image/'):
+            logger.error(f"Downloaded file is not an image. Content-Type: {content_type}")
+            logger.error(f"Received HTML instead of image. This is often a permission issue. Please ensure the bot has the 'files:read' scope.")
+            app.client.chat_update(
+                channel=channel_id,
+                ts=thinking_message['ts'],
+                text=":warning: Failed to download the image. Instead of the image, I received a webpage. This usually means I don't have the right permissions. Please make sure the bot has the `files:read` permission."
+            )
+            return
+
+        image_data = response.content
+        logger.info(f"Image downloaded. MIME Type from Slack: {mimetype}, Response Content-Type: {content_type}, Size: {len(image_data)} bytes.")
+        logger.info(f"First 16 bytes of image data: {image_data[:16]}")
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Failed to download image: {e}")
+        app.client.chat_update(
+            channel=channel_id,
+            ts=thinking_message['ts'],
+            text=f":warning: Sorry, I couldn\'t download the image to analyze it. Error: `{e}`"
+        )
+        return
+
+    try:
+        image_part = Part.from_data(data=image_data, mime_type=mimetype)
+
+        prompt = """You are a visual translation expert. Your task is to analyze the provided image and perform the following tasks:
+1. Identify all distinct pieces of text in the image.
+2. For each piece of text, describe its approximate location (e.g., 'top center', 'bottom left banner').
+3. Provide the original text you identified.
+4. Translate the text. If it's Korean, translate to English. For all other languages, translate to Korean.
+5. Present the result as a Slack message using markdown. If no text is found, state that clearly.
+
+Example Output:
+---
+*Image Text Analysis & Translation*
+
+*Location:* Top-left corner
+> *Original:* 안녕하세요
+> *Translation:* Hello
+
+*Location:* Bottom, inside a blue button
+> *Original:* Click Here
+> *Translation:* 여기를 클릭하세요
+---
+"""
+        
+        response = model.generate_content([image_part, prompt])
+        translated_description = response.text.strip()
+
+        if not translated_description:
+             translated_description = "I analyzed the image but could not find any text to translate."
+
+        app.client.chat_update(
+            channel=channel_id,
+            ts=thinking_message['ts'],
+            text=translated_description
+        )
+        logger.info(f"Successfully posted image translation for {file_obj.get('name')}")
+
+    except Exception as e:
+        logger.error(f"Error analyzing image with Gemini: {e}")
+        app.client.chat_update(
+            channel=channel_id,
+            ts=thinking_message['ts'],
+            text=f":warning: Sorry, an error occurred while analyzing the image with the AI model: `{e}`"
+        )
+
 
 def translate_message(event, say, client, logger):
     """
@@ -745,31 +842,39 @@ def handle_message_events(body, say, client, logger):
     event = body.get('event', {})
     
     # --- Message Origin Check ---
-    # 1. Ignore messages from this bot itself
     if event.get("bot_id") == BOT_ID:
         return
     
-    # 2. Ignore messages that are not new, like edits or deletions
     subtype = event.get("subtype")
     if subtype in ["message_changed", "message_deleted"]:
         return
 
-    # --- Routing ---
-    # 3. If the message is from another bot (has bot_id or is a bot_message subtype)
+    # --- Routing for Bot Messages ---
     if event.get("bot_id") or subtype == "bot_message":
         logger.info(f"--- New Bot Event Received --- \nTEXT: {event.get('text')}")
         translate_bot_message_structure(event, say, logger)
-    
-    # 4. If the message is from a user, use the standard translator
-    elif event.get("user"):
-        # Check if the channel is registered for translation
+        return 
+
+    # --- Routing for User Messages ---
+    if event.get("user"):
         channel_id = event.get('channel')
         channel_type = event.get('channel_type')
         is_registered = channel_manager.is_channel_registered(channel_id) or channel_type in ['im', 'mpim']
         
-        if is_registered and should_translate(event):
-            logger.info(f"--- New User Event Received --- \nTEXT: {event.get('text')}")
+        if not is_registered:
+            return
+
+        # Handle text content if it exists
+        if should_translate(event):
+            logger.info(f"--- New User Text Event Received --- \nTEXT: {event.get('text')}")
             translate_message(event, say, client, logger)
+
+        # Handle file attachments if they exist
+        if 'files' in event:
+            logger.info(f"--- New User File Event Received ---")
+            thread_ts = event.get('thread_ts') or event.get('ts')
+            for file_obj in event['files']:
+                handle_image_translation(file_obj, channel_id, thread_ts, say, logger, client)
 
 
 if __name__ == "__main__":
