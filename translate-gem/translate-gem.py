@@ -271,6 +271,42 @@ def ask_to_translate_image(say, channel_id, thread_ts, file_obj):
         ]
     )
 
+def ask_to_translate_og_image(say, channel_id, thread_ts, og_image_url, source_url):
+    """Asks the user if they want to translate the og:image."""
+    value_payload = json.dumps({"og_image_url": og_image_url})
+
+    say(
+        channel=channel_id,
+        thread_ts=thread_ts,
+        blocks=[
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": f"🖼️ A preview image was found for <{source_url}>. Would you like me to analyze it and translate any text found within?"
+                }
+            },
+            {
+                "type": "actions",
+                "elements": [
+                    {
+                        "type": "button",
+                        "text": {"type": "plain_text", "text": "✅ Yes, translate"},
+                        "style": "primary",
+                        "action_id": "translate_og_image_confirm",
+                        "value": value_payload
+                    },
+                    {
+                        "type": "button",
+                        "text": {"type": "plain_text", "text": "No"},
+                        "style": "danger",
+                        "action_id": "translate_image_cancel" # We can reuse the cancel action
+                    }
+                ]
+            }
+        ]
+    )
+
 @app.action("translate_title_cancel")
 def handle_translate_title_cancel(ack, body):
     ack()
@@ -346,6 +382,45 @@ def handle_translate_image_cancel(ack, body, logger):
     except Exception as e:
         logger.error(f"Error deleting image translation prompt: {e}")
 
+def _process_image_translation(channel_id, original_ts, image_url, image_name, logger, headers=None):
+    """A helper function to process image translation and update Slack messages."""
+    try:
+        # Update message to "thinking" and remove buttons
+        app.client.chat_update(
+            channel=channel_id,
+            ts=original_ts,
+            blocks=[
+                {
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": f":camera_with_flash: Analyzing image `{image_name}`... this may take a moment."
+                    }
+                }
+            ],
+            text="Analyzing image..."
+        )
+
+        analysis_result = analyze_image_from_url(image_url, logger, headers=headers)
+
+        # Update message with the final result
+        app.client.chat_update(
+            channel=channel_id,
+            ts=original_ts,
+            blocks=[], # clear blocks
+            text=analysis_result
+        )
+        logger.info(f"Successfully posted image translation for {image_name}")
+
+    except Exception as e:
+        logger.error(f"Error in _process_image_translation for {image_name}: {e}")
+        app.client.chat_update(
+            channel=channel_id,
+            ts=original_ts,
+            blocks=[],
+            text=f":warning: An error occurred while processing the image translation: ```{e}```"
+        )
+
 @app.action("translate_image_confirm")
 def handle_translate_image_confirm(ack, body, logger):
     ack()
@@ -371,25 +446,11 @@ def handle_translate_image_confirm(ack, body, logger):
             return
         
         file_obj = file_info_response.get('file')
+        image_url = file_obj.get('url_private_download')
+        image_name = file_obj.get('name')
+        headers = {'Authorization': f'Bearer {os.environ.get("SLACK_BOT_TOKEN")}'}
 
-        # 2. Update message to "thinking" and remove buttons
-        app.client.chat_update(
-            channel=channel_id,
-            ts=original_ts,
-            blocks=[
-                {
-                    "type": "section",
-                    "text": {
-                        "type": "mrkdwn",
-                        "text": f":camera_with_flash: Analyzing image `{file_obj.get('name')}`... this may take a moment."
-                    }
-                }
-            ],
-            text=f"Analyzing image..."
-        )
-
-        url = file_obj.get('url_private_download')
-        if not url:
+        if not image_url:
             logger.error("No private download URL found for the image.")
             app.client.chat_update(
                 channel=channel_id,
@@ -399,17 +460,7 @@ def handle_translate_image_confirm(ack, body, logger):
             )
             return
 
-        headers = {'Authorization': f'Bearer {os.environ.get("SLACK_BOT_TOKEN")}'}
-        analysis_result = analyze_image_from_url(url, logger, headers=headers)
-
-        # 3. Update message with the final result
-        app.client.chat_update(
-            channel=channel_id,
-            ts=original_ts,
-            blocks=[], # clear blocks
-            text=analysis_result
-        )
-        logger.info(f"Successfully posted image translation for {file_obj.get('name')}")
+        _process_image_translation(channel_id, original_ts, image_url, image_name, logger, headers=headers)
 
     except Exception as e:
         logger.error(f"Error in handle_translate_image_confirm: {e}")
@@ -419,6 +470,18 @@ def handle_translate_image_confirm(ack, body, logger):
             blocks=[],
             text=f":warning: An error occurred while processing the image translation: ```{e}```"
         )
+
+@app.action("translate_og_image_confirm")
+def handle_translate_og_image_confirm(ack, body, logger):
+    ack()
+    action_details = json.loads(body['actions'][0]['value'])
+    og_image_url = action_details['og_image_url']
+    
+    original_ts = body['message']['ts']
+    channel_id = body['channel']['id']
+    
+    image_name = f"preview image from <{og_image_url}>"
+    _process_image_translation(channel_id, original_ts, og_image_url, image_name, logger)
 
 
 
@@ -870,16 +933,7 @@ Text to translate:
                 if summary_blocks:
                     say(channel=channel_id, thread_ts=thread_for_follow_ups, blocks=summary_blocks, unfurl_links=False)
                 if og_image_url:
-                    thinking_message = say(channel=channel_id, thread_ts=thread_for_follow_ups, text=f":camera_with_flash: Analyzing preview image from <{clean_url}>...")
-                    analysis_result = analyze_image_from_url(og_image_url, logger)
-                    if thinking_message and thinking_message.get('ts'):
-                        app.client.chat_update(
-                            channel=channel_id,
-                            ts=thinking_message['ts'],
-                            text=analysis_result
-                        )
-                    else:
-                        say(channel=channel_id, thread_ts=thread_for_follow_ups, text=analysis_result)
+                    ask_to_translate_og_image(say, channel_id, thread_for_follow_ups, og_image_url, clean_url)
 
     except Exception as e:
         logger.error(f"Error during translation process: {e}")
