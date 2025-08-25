@@ -866,9 +866,20 @@ Text to translate:
                         logger.error(f"Error processing Notion link {clean_url}: {e}")
 
             elif 'slack.com' not in clean_url:
-                summary_blocks = create_url_summary_blocks(clean_url, logger)
+                summary_blocks, og_image_url = create_url_summary_blocks(clean_url, logger)
                 if summary_blocks:
                     say(channel=channel_id, thread_ts=thread_for_follow_ups, blocks=summary_blocks, unfurl_links=False)
+                if og_image_url:
+                    thinking_message = say(channel=channel_id, thread_ts=thread_for_follow_ups, text=f":camera_with_flash: Analyzing preview image from <{clean_url}>...")
+                    analysis_result = analyze_image_from_url(og_image_url, logger)
+                    if thinking_message and thinking_message.get('ts'):
+                        app.client.chat_update(
+                            channel=channel_id,
+                            ts=thinking_message['ts'],
+                            text=analysis_result
+                        )
+                    else:
+                        say(channel=channel_id, thread_ts=thread_for_follow_ups, text=analysis_result)
 
     except Exception as e:
         logger.error(f"Error during translation process: {e}")
