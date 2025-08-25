@@ -155,3 +155,4 @@ translate-gem/registered_channels.json
 
 # Database files
 processed_news.db
+translate-gem/news-translation-error.txt
