@@ -509,12 +509,13 @@ def translate_text_chunk(text, target_language, logger):
         return ""
 
     # Clean the text before translation: replace <URL|Text> with just Text
-    cleaned_text = re.sub(r'<(https?://[^|]+)\|([^>]+)>', r'\2', text)
+    cleaned_text = re.sub(r'<(https?://[^|]+)\|([^>]+)>', r'\\2', text)
 
-    source_language = "Korean" if target_language == "English" else "another language (e.g., English)"
+    logger.info(f"Text chunk to be translated to {target_language}:\n{cleaned_text}")
+
     prompt = f'''You are a professional translator. Your task is to translate the text provided inside the <translate> XML tags.
-- The source language is {source_language}.
-- Translate it to {target_language}.
+- First, detect the source language of the text.
+- Then, translate it to {target_language}.
 - Preserve all original line breaks and spacing.
 - Provide only the raw, translated text. Do not add any extra explanations, introductory phrases, or the XML tags.
 
@@ -527,46 +528,87 @@ def translate_text_chunk(text, target_language, logger):
         response = model.generate_content(prompt, generation_config=generation_config)
         
         if not response.candidates or not response.candidates[0].content.parts:
-            logger.warning("Translation result was empty. It might have been blocked.")
+            logger.warning(f"Translation result was empty for target language {target_language}. It might have been blocked.")
             return "[Translation failed or was blocked by safety filters]"
         
         return response.text.strip()
     except Exception as e:
-        logger.error(f"Error during text chunk translation: {e}")
+        logger.error(f"Error during text chunk translation to {target_language}: {e}")
         return f"[Translation Error] {e}"
 
-@app.command("/translate-notion")
-def handle_translate_notion(ack, command, say, logger):
-    """Handles the /translate-notion command to translate a full Notion page while preserving formatting."""
-    ack() 
-    
-    url = command.get('text', '').strip()
-    if not url or ('notion.so' not in url and 'notion.site' not in url):
-        say(text="Please provide a valid Notion URL. Usage: `/translate-notion <notion_page_url>`")
-        return
+def translate_text_chunks(texts, target_language, logger):
+    """Translates a list of text chunks using the generative model."""
+    if not texts:
+        return []
 
-    page_id = get_page_id_from_url(url)
-    if not page_id:
-        say(text="I couldn\'t find a valid Page ID in that URL. Please check the link and try again.")
-        return
+    # Clean the texts before translation
+    cleaned_texts = [re.sub(r'<(https?://[^|]+)\|([^>]+)>', r'\\2', text) for text in texts]
 
-    thinking_message = say(text=f":hourglass_flowing_sand: Translating Notion page: <{url}>. This might take a moment...")
-    
+    # Create a single prompt with all the texts
+    # Using a structured format (JSON) for input and output
+    prompt = f"""You are a professional translator. Your task is to translate the following text chunks to {target_language}.
+The text chunks are provided in a JSON array of strings.
+Your response MUST be a JSON array of strings with the translated text chunks in the exact same order.
+Preserve all original line breaks and spacing within each chunk.
+Provide only the raw JSON array in your response.
+
+{json.dumps(cleaned_texts, ensure_ascii=False)}
+"""
+
+    try:
+        generation_config = GenerationConfig(
+            max_output_tokens=8192,
+        )
+        response = model.generate_content(prompt, generation_config=generation_config)
+        
+        if not response.candidates or not response.candidates[0].content.parts:
+            logger.warning(f"Translation result was empty for target language {target_language}. It might have been blocked.")
+            return ["[Translation failed or was blocked by safety filters]"] * len(texts)
+        
+        # Clean the response text
+        response_text = response.text.strip()
+        if response_text.startswith("```json"):
+            response_text = response_text[7:]
+        if response_text.startswith("```"):
+            response_text = response_text[3:]
+        if response_text.endswith("```"):
+            response_text = response_text[:-3]
+
+        # Parse the JSON response
+        logger.info(f"Cleaned response from translation model: {response_text}")
+        translated_texts = json.loads(response_text)
+        
+        if len(translated_texts) != len(texts):
+            logger.warning(f"Translated chunks count mismatch. Expected {len(texts)}, got {len(translated_texts)}. Falling back to one-by-one translation.")
+            return [translate_text_chunk(text, target_language, logger) for text in texts]
+
+        return translated_texts
+
+    except (json.JSONDecodeError, TypeError) as e:
+        logger.error(f"Error parsing JSON response from translation model: {e}. Falling back to one-by-one translation.")
+        return [translate_text_chunk(text, target_language, logger) for text in texts]
+    except Exception as e:
+        logger.error(f"Error during batch text chunk translation to {target_language}: {e}")
+        return [f"[Translation Error] {e}"] * len(texts)
+
+
+def process_notion_translation(page_id, url, channel_id, thinking_message_ts, logger, target_language=None):
+    """Processes the translation of a Notion page."""
+    CHARACTER_LIMIT = 5000  # Character limit for each translation chunk
+
     try:
         # 1. Fetch original page to get title and parent
         logger.info(f"Fetching page details for {page_id}")
         original_page = notion.pages.retrieve(page_id=page_id)
         
-        title_property = None
-        title_prop_name = None
+        title_property, title_prop_name = None, None
         for prop_name, prop_details in original_page.get('properties', {}).items():
             if prop_details.get('type') == 'title':
-                title_property = prop_details
-                title_prop_name = prop_name
+                title_property, title_prop_name = prop_details, prop_name
                 break
         
         if not title_property or not title_prop_name:
-            app.client.chat_update(channel=command['channel_id'], ts=thinking_message['ts'], text=":warning: Could not find a title property for the given Notion page.")
+            app.client.chat_update(channel=channel_id, ts=thinking_message_ts, text=":warning: Could not find a title property for the given Notion page.")
             return
 
         original_title = title_property.get('title', [{}])[0].get('plain_text', 'Untitled')
@@ -576,77 +618,102 @@ def handle_translate_notion(ack, command, say, logger):
         logger.info(f"Fetching all blocks for page {page_id}")
         blocks = fetch_all_blocks(page_id, logger)
         if not blocks:
-            app.client.chat_update(channel=command['channel_id'], ts=thinking_message['ts'], text=":warning: The Notion page appears to be empty. There's nothing to translate.")
+            app.client.chat_update(channel=channel_id, ts=thinking_message_ts, text=":warning: The Notion page appears to be empty. There's nothing to translate.")
             return
             
-        # 3. Determine translation direction from the first few text blocks
-        page_text_for_lang_detect = "".join(
-            "".join(t.get('plain_text', '') for t in b.get(b.get('type'), {}).get('rich_text', []))
-            for b in blocks[:10] if b.get('type') in ['paragraph', 'heading_1', 'heading_2', 'heading_3']
-        )
-        is_korean = any('가' <= char <= '힣' for char in page_text_for_lang_detect)
-        target_language = "English" if is_korean else "Korean"
-        new_title_suffix = "_EN" if is_korean else "_KR"
-        logger.info(f"Determined translation direction: {'KR' if is_korean else 'EN'} -> {target_language}")
+        # 3. Determine translation direction if not provided
+        if not target_language:
+            page_text_for_lang_detect = "".join(
+                "".join(t.get('plain_text', '') for t in b.get(b.get('type'), {}).get('rich_text', []))
+                for b in blocks[:10] if b.get('type') in ['paragraph', 'heading_1', 'heading_2', 'heading_3']
+            )
+            is_korean = any('가' <= char <= '힣' for char in page_text_for_lang_detect)
+            target_language = "English" if is_korean else "Korean"
+            logger.info(f"Determined translation direction: {'KR' if is_korean else 'EN'} -> {target_language}")
 
-        # 4. Translate block by block, preserving structure
+        new_title_suffix = f"_{target_language[:2].upper()}"
+
+        # 4. Group and translate blocks
         new_blocks = []
-        for block in blocks:
+        i = 0
+        while i < len(blocks):
+            block = blocks[i]
             block_type = block.get('type')
-            
-            # A. Handle text-based blocks that need translation
-            if block_type in ['paragraph', 'heading_1', 'heading_2', 'heading_3', 'bulleted_list_item', 'numbered_list_item', 'quote', 'callout', 'toggle']:
-                original_text = "".join([t.get('plain_text', '') for t in block.get(block_type, {}).get('rich_text', [])])
-                
-                if original_text.strip():
-                    translated_text = translate_text_chunk(original_text, target_language, logger)
-                    
-                    new_block = {
-                        "object": "block",
-                        "type": block_type,
-                        block_type: { "rich_text": [{"type": "text", "text": {"content": translated_text}}] }
-                    }
-                    # Preserve special properties like color and icon
-                    if block_type == 'callout':
-                        if 'color' in block[block_type]:
-                            new_block[block_type]['color'] = block[block_type]['color']
-                        if 'icon' in block[block_type]:
-                            new_block[block_type]['icon'] = block[block_type]['icon']
-                    new_blocks.append(new_block)
-                else:
-                    # Preserve empty blocks (e.g., empty lines)
-                    new_blocks.append(block)
 
-            # B. Handle non-text blocks that should be copied as-is
+            if block_type in ['paragraph', 'heading_1', 'heading_2', 'heading_3', 'bulleted_list_item', 'numbered_list_item', 'quote', 'callout', 'toggle']:
+                current_group_blocks = []
+                current_group_text_len = 0
+                
+                j = i
+                while j < len(blocks) and blocks[j].get('type') == block_type:
+                    block_to_add = blocks[j]
+                    text_to_add = "".join([t.get('plain_text', '') for t in block_to_add.get(block_type, {}).get('rich_text', [])])
+                    
+                    if current_group_text_len + len(text_to_add) > CHARACTER_LIMIT and current_group_blocks:
+                        break
+
+                    current_group_blocks.append(block_to_add)
+                    current_group_text_len += len(text_to_add)
+                    j += 1
+
+                original_texts = ["".join([t.get('plain_text', '') for t in b.get(block_type, {}).get('rich_text', [])]) for b in current_group_blocks]
+                
+                non_empty_texts = [text for text in original_texts if text.strip()]
+                non_empty_indices = [idx for idx, text in enumerate(original_texts) if text.strip()]
+
+                if non_empty_texts:
+                    translated_texts_non_empty = translate_text_chunks(non_empty_texts, target_language, logger)
+                    translated_texts = ["" for _ in original_texts]
+                    for idx, translated_text in zip(non_empty_indices, translated_texts_non_empty):
+                        translated_texts[idx] = translated_text
+                else:
+                    translated_texts = ["" for _ in original_texts]
+
+                for original_block, translated_text in zip(current_group_blocks, translated_texts):
+                    if translated_text.strip():
+                        new_block = {
+                            "object": "block",
+                            "type": block_type,
+                            block_type: { "rich_text": [{"type": "text", "text": {"content": translated_text}}] }
+                        }
+                        if block_type == 'callout':
+                            if 'color' in original_block[block_type]:
+                                new_block[block_type]['color'] = original_block[block_type]['color']
+                            if 'icon' in original_block[block_type]:
+                                new_block[block_type]['icon'] = original_block[block_type]['icon']
+                        new_blocks.append(new_block)
+                    else:
+                        new_blocks.append(original_block)
+                
+                i = j
+
             elif block_type in ['divider', 'image', 'file', 'video', 'code']:
-                # For 'code' blocks, we don't translate the code itself.
                 new_blocks.append(block)
-            
-            # C. Other block types are currently ignored but could be added here.
+                i += 1
+            else:
+                new_blocks.append(block)
+                i += 1
 
         # 5. Create the new page with the translated blocks
-        logger.info(f"Creating new translated page for {page_id}")
-
         # --- Translate Title Logic ---
-        # Check if the title is primarily Korean and not already in a bilingual format.
         is_candidate_for_title_translation = re.search(r'[가-힣]', original_title) and not (
             re.search(r'[a-zA-Z]', original_title) and
             ('/' in original_title or re.search(r'\s*\([^)]+\)', original_title))
         )
 
-        if is_candidate_for_title_translation:
+        if target_language == "English" and is_candidate_for_title_translation:
             logger.info(f"Title '{original_title}' is a candidate for KR -> EN translation.")
             title_prompt = f"Translate the following Korean document title to English. Respond with only the translated title, without any additional text or quotation marks. Title: '{original_title}'"
             title_translation_response = model.generate_content(title_prompt)
-            english_title = title_translation_response.text.strip().replace('"', '') # Remove quotes just in case
-            # Create the new title in "Korean (English)" format
+            english_title = title_translation_response.text.strip().replace('"', '')
             new_title = f"{original_title} ({english_title})"
         else:
             logger.info(f"Title '{original_title}' will not be translated, appending suffix instead.")
-            # If not a candidate for translation, just append the suffix.
             new_title = f"{original_title}{new_title_suffix}"
         
-        # The children array for a page create request can have a maximum of 100 blocks.
+        logger.info(f"Creating new translated page for {page_id} with title '{new_title}'")
+        logger.info(f"Creating new page in parent: {json.dumps(parent, indent=2)}")
+
         blocks_to_create = new_blocks[:100]
         
         new_page = notion.pages.create(
@@ -660,7 +727,6 @@ def handle_translate_notion(ack, command, say, logger):
         )
         logger.info(f"Successfully created new page with ID: {new_page['id']}")
 
-        # If there are more blocks, append them in chunks of 100.
         remaining_blocks = new_blocks[100:]
         for i in range(0, len(remaining_blocks), 100):
             chunk = remaining_blocks[i:i+100]
@@ -669,19 +735,69 @@ def handle_translate_notion(ack, command, say, logger):
 
         # 6. Final success message
         app.client.chat_update(
-            channel=command['channel_id'],
-            ts=thinking_message['ts'],
+            channel=channel_id,
+            ts=thinking_message_ts,
             text=f"✅ Translation complete! A new page has been created:\n*<{new_page['url']}|{new_title}>*"
         )
 
     except notion_client.errors.APIResponseError as e:
         logger.error(f"Notion API Error during translation: {e}")
+        if e.code == 'validation_error':
+            logger.error(f"Validation error details: {e}")
         error_message = f":warning: A Notion API error occurred: `{e.code}`. I might not have the right permissions for the page or its parent."
-        app.client.chat_update(channel=command['channel_id'], ts=thinking_message['ts'], text=error_message)
+        app.client.chat_update(channel=channel_id, ts=thinking_message_ts, text=error_message)
     except Exception as e:
         logger.error(f"An unexpected error occurred during Notion translation: {e}")
-        error_message = f":warning: An unexpected error occurred: ```{e}```"
-        app.client.chat_update(channel=command['channel_id'], ts=thinking_message['ts'], text=error_message)
+        error_message = f":warning: An unexpected error occurred: ```{{e}}```"
+        app.client.chat_update(channel=channel_id, ts=thinking_message_ts, text=error_message)
+
+
+@app.command("/translate-notion")
+def handle_translate_notion(ack, command, say, logger):
+    """Handles the /translate-notion command to translate a full Notion page while preserving formatting."""
+    ack()
+
+    text = command.get('text', '').strip()
+    parts = text.split()
+    url = ""
+    target_language_arg = None
+
+    if len(parts) > 0:
+        url = parts[0]
+    if len(parts) > 1:
+        target_language_arg = parts[1]
+
+    if not url or ('notion.so' not in url and 'notion.site' not in url):
+        say(text="Please provide a valid Notion URL. Usage: `/translate-notion <notion_page_url> [target_language]`")
+        return
+
+    page_id = get_page_id_from_url(url)
+    if not page_id:
+        say(text="I couldn't find a valid Page ID in that URL. Please check the link and try again.")
+        return
+
+    thinking_message = say(text=f":hourglass_flowing_sand: Translating Notion page: <{url}>. This might take a moment...")
+    
+    process_notion_translation(page_id, url, command['channel_id'], thinking_message['ts'], logger, target_language=target_language_arg)
+
+@app.command("/translate-notion-jp")
+def handle_translate_notion_jp(ack, command, say, logger):
+    """Handles the /translate-notion-jp command to translate a full Notion page to Japanese."""
+    ack() 
+    
+    url = command.get('text', '').strip()
+    if not url or ('notion.so' not in url and 'notion.site' not in url):
+        say(text="Please provide a valid Notion URL. Usage: `/translate-notion-jp <notion_page_url>`")
+        return
+
+    page_id = get_page_id_from_url(url)
+    if not page_id:
+        say(text="I couldn\'t find a valid Page ID in that URL. Please check the link and try again.")
+        return
+
+    thinking_message = say(text=f":hourglass_flowing_sand: Translating Notion page to Japanese: <{url}>. This might take a moment...")
+    
+    process_notion_translation(page_id, url, command['channel_id'], thinking_message['ts'], logger, target_language="Japanese")
 
 def analyze_image_from_url(image_url, logger, headers=None):
     """
