@@ -1,0 +1,16 @@
+[Unit]
+Description=Translate Gem Slack Bot Service
+After=network.target
+
+[Service]
+Type=simple
+User=nephilim
+Group=nephilim
+WorkingDirectory=/home/nephilim/space-gemini/translate-gem
+ExecStart=/bin/bash -c '/home/nephilim/space-gemini/.venv/bin/python3 /home/nephilim/space-gemini/translate-gem/translate-gem.py > /home/nephilim/space-gemini/translate-gem/nohup_$(date +%%Y%%m%%d_%%H%%M).out 2>&1'
+Restart=always
+RestartSec=60
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target

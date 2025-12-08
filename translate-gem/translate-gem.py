@@ -146,7 +146,7 @@ def handle_member_joined_channel(event, say, logger):
         try:
             say(
                 channel=channel_id,
-                text="Hello! I've been invited to this direct message channel and will now automatically translate messages. No extra commands needed!"
+                text="Hello! I\'ve been invited to this direct message channel and will now automatically translate messages. No extra commands needed!"
             )
             logger.info(f"Joined and sent welcome message to mpim channel: {channel_id}")
         except Exception as e:
@@ -508,20 +508,17 @@ def translate_text_chunk(text, target_language, logger):
     if not text.strip():
         return ""
 
-    # Clean the text before translation: replace <URL|Text> with just Text
+    # Clean the text before translation
     cleaned_text = re.sub(r'<(https?://[^|]+)\|([^>]+)>', r'\\2', text)
-
     logger.info(f"Text chunk to be translated to {target_language}:\n{cleaned_text}")
 
-    prompt = f'''You are a professional translator. Your task is to translate the text provided inside the <translate> XML tags.
-- First, detect the source language of the text.
-- Then, translate it to {target_language}.
+    # Simplified direct prompt
+    prompt = f'''You are a professional translator. Your task is to translate the following text to {target_language}.
 - Preserve all original line breaks and spacing.
-- Provide only the raw, translated text. Do not add any extra explanations, introductory phrases, or the XML tags.
+- Provide only the raw, translated text. Do not add any extra explanations or introductory phrases.
 
-<translate>
+Text to translate:
 {cleaned_text}
-</translate>
 '''
     try:
         generation_config = GenerationConfig(max_output_tokens=2048)
@@ -537,220 +534,213 @@ def translate_text_chunk(text, target_language, logger):
         return f"[Translation Error] {e}"
 
 def translate_text_chunks(texts, target_language, logger):
-    """Translates a list of text chunks using the generative model."""
+    """Translates a list of text chunks using a simplified, non-JSON prompt."""
     if not texts:
         return []
 
     # Clean the texts before translation
     cleaned_texts = [re.sub(r'<(https?://[^|]+)\|([^>]+)>', r'\\2', text) for text in texts]
 
-    # Create a single prompt with all the texts
-    # Using a structured format (JSON) for input and output
-    prompt = f"""You are a professional translator. Your task is to translate the following text chunks to {target_language}.
-The text chunks are provided in a JSON array of strings.
-Your response MUST be a JSON array of strings with the translated text chunks in the exact same order.
-Preserve all original line breaks and spacing within each chunk.
-Provide only the raw JSON array in your response.
+    # Define a unique separator
+    separator = "---[GEMINI-TRANSLATE-BOUNDARY]---"
 
-{json.dumps(cleaned_texts, ensure_ascii=False)}
+    # Create a single prompt with all texts joined by the separator
+    combined_text = f"\n{separator}\n".join(cleaned_texts)
+
+    prompt = f"""You are a professional translator. Your task is to translate the following text segments to {target_language}.
+The segments are separated by a unique boundary string: `{separator}`.
+Your response MUST contain the translated segments, separated by the exact same boundary string.
+Preserve all original line breaks and spacing within each segment.
+Provide only the raw, translated text with the separators. Do not add any other explanations.
+
+Text to translate:
+{combined_text}
 """
 
     try:
-        generation_config = GenerationConfig(
-            max_output_tokens=8192,
-        )
+        generation_config = GenerationConfig(max_output_tokens=8192)
         response = model.generate_content(prompt, generation_config=generation_config)
         
         if not response.candidates or not response.candidates[0].content.parts:
-            logger.warning(f"Translation result was empty for target language {target_language}. It might have been blocked.")
+            logger.warning(f"Batch translation result was empty for target language {target_language}. It might have been blocked.")
             return ["[Translation failed or was blocked by safety filters]"] * len(texts)
         
-        # Clean the response text
-        response_text = response.text.strip()
-        if response_text.startswith("```json"):
-            response_text = response_text[7:]
-        if response_text.startswith("```"):
-            response_text = response_text[3:]
-        if response_text.endswith("```"):
-            response_text = response_text[:-3]
+        response_text = response.text
+        translated_texts = response_text.split(separator)
 
-        # Parse the JSON response
-        logger.info(f"Cleaned response from translation model: {response_text}")
-        translated_texts = json.loads(response_text)
+        # Trim leading/trailing whitespace that might result from the split
+        translated_texts = [text.strip() for text in translated_texts]
         
         if len(translated_texts) != len(texts):
             logger.warning(f"Translated chunks count mismatch. Expected {len(texts)}, got {len(translated_texts)}. Falling back to one-by-one translation.")
+            # Fallback to individual translation if the batch fails
             return [translate_text_chunk(text, target_language, logger) for text in texts]
 
         return translated_texts
 
-    except (json.JSONDecodeError, TypeError) as e:
-        logger.error(f"Error parsing JSON response from translation model: {e}. Falling back to one-by-one translation.")
-        return [translate_text_chunk(text, target_language, logger) for text in texts]
     except Exception as e:
-        logger.error(f"Error during batch text chunk translation to {target_language}: {e}")
-        return [f"[Translation Error] {e}"] * len(texts)
+        logger.error(f"Error during batch text chunk translation to {target_language}: {e}. Falling back to one-by-one translation.")
+        # Fallback to individual translation on any exception
+        return [translate_text_chunk(text, target_language, logger) for text in texts]
 
+def collect_texts_recursively(source_block_id, logger, text_collection):
+    """
+    Recursively traverses blocks to collect all translatable text content.
+    Appends {'id': block_id, 'text': text_content} dicts to text_collection list.
+    """
+    try:
+        original_blocks = fetch_all_blocks(source_block_id, logger)
+        for block in original_blocks:
+            block_type = block.get('type')
+            if block_type in ['paragraph', 'heading_1', 'heading_2', 'heading_3', 'bulleted_list_item', 'numbered_list_item', 'quote', 'callout', 'toggle']:
+                text_content = "".join([t.get('plain_text', '') for t in block.get(block_type, {}).get('rich_text', [])])
+                if text_content.strip():
+                    text_collection.append({'id': block['id'], 'text': text_content})
+            
+            if block.get('has_children'):
+                collect_texts_recursively(block['id'], logger, text_collection)
+    except Exception as e:
+        logger.error(f"Error collecting texts from block {source_block_id}: {e}")
+
+def build_page_recursively(source_block_id, target_block_id, translated_text_map, logger):
+    """
+    Recursively rebuilds the page structure using the translated text map,
+    maintaining a 1:1 block correspondence to ensure recursion indexes are correct.
+    """
+    original_blocks = fetch_all_blocks(source_block_id, logger)
+    if not original_blocks:
+        return
+
+    new_blocks_for_api = []
+    recursion_tasks = []
+
+    for i, block in enumerate(original_blocks):
+        block_type = block.get('type')
+        new_block = None
+
+        # Reconstruct translatable block types
+        if block_type in ['paragraph', 'heading_1', 'heading_2', 'heading_3', 'bulleted_list_item', 'numbered_list_item', 'quote', 'callout', 'toggle']:
+            translated_text = translated_text_map.get(block['id'])
+            rich_text = [{"type": "text", "text": {"content": translated_text}}] if translated_text else block[block_type].get('rich_text', [])
+            
+            new_block = {"object": "block", "type": block_type, block_type: {"rich_text": rich_text}}
+            if block_type == 'callout':
+                if 'color' in block[block_type]: new_block[block_type]['color'] = block[block_type]['color']
+                if 'icon' in block[block_type]: new_block[block_type]['icon'] = block[block_type]['icon']
+        
+        # Reconstruct non-text blocks that are copied as-is
+        elif block_type in ['divider', 'image', 'file', 'video', 'code']:
+            new_block = {"object": "block", "type": block_type, block_type: block[block_type]}
+        
+        # If block type is unsupported or failed, create an empty paragraph to maintain index
+        if not new_block:
+            new_block = {"object": "block", "type": "paragraph", "paragraph": {"rich_text": []}}
+
+        new_blocks_for_api.append(new_block)
+
+        if block.get('has_children'):
+            recursion_tasks.append({'original_id': block['id'], 'index': i})
+
+    # Append new blocks to the target
+    appended_blocks_results = []
+    if new_blocks_for_api:
+        for i in range(0, len(new_blocks_for_api), 100):
+            chunk = new_blocks_for_api[i:i+100]
+            logger.info(f"Appending {len(chunk)} blocks to target {target_block_id}")
+            try:
+                response = notion.blocks.children.append(block_id=target_block_id, children=chunk)
+                appended_blocks_results.extend(response.get('results', []))
+            except Exception as e:
+                logger.error(f"Failed to append block chunk: {e}")
+                # Add placeholders to keep index integrity
+                appended_blocks_results.extend([None] * len(chunk))
+
+    # Recurse for blocks with children
+    for task in recursion_tasks:
+        if task['index'] < len(appended_blocks_results):
+            new_parent_block = appended_blocks_results[task['index']]
+            if new_parent_block:
+                build_page_recursively(task['original_id'], new_parent_block['id'], translated_text_map, logger)
+            else:
+                logger.warning(f"Skipping recursion for block at index {task['index']} as it failed to be created.")
 
 def process_notion_translation(page_id, url, channel_id, thinking_message_ts, logger, target_language=None):
-    """Processes the translation of a Notion page."""
-    CHARACTER_LIMIT = 5000  # Character limit for each translation chunk
-
+    """Processes the translation of a Notion page using a two-pass recursive method."""
     try:
-        # 1. Fetch original page to get title and parent
+        # 1. Fetch original page details
         logger.info(f"Fetching page details for {page_id}")
         original_page = notion.pages.retrieve(page_id=page_id)
-        
-        title_property, title_prop_name = None, None
-        for prop_name, prop_details in original_page.get('properties', {}).items():
-            if prop_details.get('type') == 'title':
-                title_property, title_prop_name = prop_details, prop_name
-                break
-        
-        if not title_property or not title_prop_name:
-            app.client.chat_update(channel=channel_id, ts=thinking_message_ts, text=":warning: Could not find a title property for the given Notion page.")
+        title_property, title_prop_name = next(((prop_details, prop_name) for prop_name, prop_details in original_page.get('properties', {}).items() if prop_details.get('type') == 'title'), (None, None))
+
+        if not title_property:
+            app.client.chat_update(channel=channel_id, ts=thinking_message_ts, text=":warning: Could not find a title property for the page.")
             return
 
         original_title = title_property.get('title', [{}])[0].get('plain_text', 'Untitled')
         parent = original_page.get('parent')
 
-        # 2. Fetch all blocks from the page
-        logger.info(f"Fetching all blocks for page {page_id}")
-        blocks = fetch_all_blocks(page_id, logger)
-        if not blocks:
-            app.client.chat_update(channel=channel_id, ts=thinking_message_ts, text=":warning: The Notion page appears to be empty. There's nothing to translate.")
-            return
-            
-        # 3. Determine translation direction if not provided
+        # 2. Determine translation direction
         if not target_language:
-            page_text_for_lang_detect = "".join(
-                "".join(t.get('plain_text', '') for t in b.get(b.get('type'), {}).get('rich_text', []))
-                for b in blocks[:10] if b.get('type') in ['paragraph', 'heading_1', 'heading_2', 'heading_3']
-            )
+            text_collection_for_lang_detect = []
+            collect_texts_recursively(page_id, logger, text_collection_for_lang_detect)
+            page_text_for_lang_detect = " ".join(item['text'] for item in text_collection_for_lang_detect[:10])
             is_korean = any('가' <= char <= '힣' for char in page_text_for_lang_detect)
             target_language = "English" if is_korean else "Korean"
-            logger.info(f"Determined translation direction: {'KR' if is_korean else 'EN'} -> {target_language}")
+            logger.info(f"Determined translation direction -> {target_language}")
 
+        # 3. Translate Title
         new_title_suffix = f"_{target_language[:2].upper()}"
-
-        # 4. Group and translate blocks
-        new_blocks = []
-        i = 0
-        while i < len(blocks):
-            block = blocks[i]
-            block_type = block.get('type')
-
-            if block_type in ['paragraph', 'heading_1', 'heading_2', 'heading_3', 'bulleted_list_item', 'numbered_list_item', 'quote', 'callout', 'toggle']:
-                current_group_blocks = []
-                current_group_text_len = 0
-                
-                j = i
-                while j < len(blocks) and blocks[j].get('type') == block_type:
-                    block_to_add = blocks[j]
-                    text_to_add = "".join([t.get('plain_text', '') for t in block_to_add.get(block_type, {}).get('rich_text', [])])
-                    
-                    if current_group_text_len + len(text_to_add) > CHARACTER_LIMIT and current_group_blocks:
-                        break
-
-                    current_group_blocks.append(block_to_add)
-                    current_group_text_len += len(text_to_add)
-                    j += 1
-
-                original_texts = ["".join([t.get('plain_text', '') for t in b.get(block_type, {}).get('rich_text', [])]) for b in current_group_blocks]
-                
-                non_empty_texts = [text for text in original_texts if text.strip()]
-                non_empty_indices = [idx for idx, text in enumerate(original_texts) if text.strip()]
-
-                if non_empty_texts:
-                    translated_texts_non_empty = translate_text_chunks(non_empty_texts, target_language, logger)
-                    translated_texts = ["" for _ in original_texts]
-                    for idx, translated_text in zip(non_empty_indices, translated_texts_non_empty):
-                        translated_texts[idx] = translated_text
-                else:
-                    translated_texts = ["" for _ in original_texts]
-
-                for original_block, translated_text in zip(current_group_blocks, translated_texts):
-                    if translated_text.strip():
-                        new_block = {
-                            "object": "block",
-                            "type": block_type,
-                            block_type: { "rich_text": [{"type": "text", "text": {"content": translated_text}}] }
-                        }
-                        if block_type == 'callout':
-                            if 'color' in original_block[block_type]:
-                                new_block[block_type]['color'] = original_block[block_type]['color']
-                            if 'icon' in original_block[block_type]:
-                                new_block[block_type]['icon'] = original_block[block_type]['icon']
-                        new_blocks.append(new_block)
-                    else:
-                        new_blocks.append(original_block)
-                
-                i = j
-
-            elif block_type in ['divider', 'image', 'file', 'video', 'code']:
-                new_blocks.append(block)
-                i += 1
-            else:
-                new_blocks.append(block)
-                i += 1
-
-        # 5. Create the new page with the translated blocks
-        # --- Translate Title Logic ---
-        is_candidate_for_title_translation = re.search(r'[가-힣]', original_title) and not (
-            re.search(r'[a-zA-Z]', original_title) and
-            ('/' in original_title or re.search(r'\s*\([^)]+\)', original_title))
-        )
-
-        if target_language == "English" and is_candidate_for_title_translation:
-            logger.info(f"Title '{original_title}' is a candidate for KR -> EN translation.")
-            title_prompt = f"Translate the following Korean document title to English. Respond with only the translated title, without any additional text or quotation marks. Title: '{original_title}'"
-            title_translation_response = model.generate_content(title_prompt)
-            english_title = title_translation_response.text.strip().replace('"', '')
+        is_candidate = re.search(r'[가-힣]', original_title) and not (re.search(r'[a-zA-Z]', original_title) and ('/' in original_title or re.search(r'\s*\([^)]+\)', original_title)))
+        if target_language == "English" and is_candidate:
+            prompt = f"Translate the following Korean document title to English. Respond with only the translated title. Title: '{original_title}'"
+            english_title = model.generate_content(prompt).text.strip().replace('"', '')
             new_title = f"{original_title} ({english_title})"
         else:
-            logger.info(f"Title '{original_title}' will not be translated, appending suffix instead.")
             new_title = f"{original_title}{new_title_suffix}"
-        
-        logger.info(f"Creating new translated page for {page_id} with title '{new_title}'")
-        logger.info(f"Creating new page in parent: {json.dumps(parent, indent=2)}")
 
-        blocks_to_create = new_blocks[:100]
-        
-        new_page = notion.pages.create(
-            parent=parent,
-            properties={
-                title_prop_name: {
-                    "title": [{"text": {"content": new_title}}]
-                }
-            },
-            children=blocks_to_create
-        )
-        logger.info(f"Successfully created new page with ID: {new_page['id']}")
+        # 4. Create the new empty page
+        logger.info(f"Creating new page with title '{new_title}'")
+        new_page = notion.pages.create(parent=parent, properties={title_prop_name: {"title": [{"text": {"content": new_title}}]}})
+        new_page_id = new_page['id']
+        logger.info(f"Created new empty page: {new_page_id}")
 
-        remaining_blocks = new_blocks[100:]
-        for i in range(0, len(remaining_blocks), 100):
-            chunk = remaining_blocks[i:i+100]
-            logger.info(f"Appending block chunk {i//100 + 1} to page {new_page['id']}")
-            notion.blocks.children.append(block_id=new_page['id'], children=chunk)
+        # 5. Start Two-Pass Translation Process
+        # Pass 1: Collect all texts
+        logger.info("Pass 1: Collecting all translatable text.")
+        text_collection = []
+        collect_texts_recursively(page_id, logger, text_collection)
+
+        if not text_collection:
+            # If there's no text, still copy the structure
+            logger.info("No text found to translate, copying structure only.")
+            build_page_recursively(page_id, new_page_id, {}, logger)
+            app.client.chat_update(channel=channel_id, ts=thinking_message_ts, text=f"✅ Translation complete, but no text was found to translate. The structure has been copied.\n*<{new_page['url']}|{new_title}>*")
+            return
+
+        # Pass 2: Batch translate
+        logger.info(f"Pass 2: Translating {len(text_collection)} text blocks.")
+        original_texts = [item['text'] for item in text_collection]
+        translated_texts = translate_text_chunks(original_texts, target_language, logger)
+        translated_text_map = {item['id']: translated_texts[i] for i, item in enumerate(text_collection)}
+
+        # Pass 3: Recursively build the new page
+        logger.info("Pass 3: Rebuilding the translated page structure.")
+        build_page_recursively(page_id, new_page_id, translated_text_map, logger)
 
         # 6. Final success message
-        app.client.chat_update(
-            channel=channel_id,
-            ts=thinking_message_ts,
-            text=f"✅ Translation complete! A new page has been created:\n*<{new_page['url']}|{new_title}>*"
-        )
+        app.client.chat_update(channel=channel_id, ts=thinking_message_ts, text=f"✅ Translation complete! A new page has been created:\n*<{new_page['url']}|{new_title}>*")
 
     except notion_client.errors.APIResponseError as e:
         logger.error(f"Notion API Error during translation: {e}")
+        error_message = f":warning: A Notion API error occurred: `{e.code}`. Possible reasons:\n- I might lack permissions for the original page or its parent location.\n- The page might be empty or have an unsupported structure."
         if e.code == 'validation_error':
-            logger.error(f"Validation error details: {e}")
-        error_message = f":warning: A Notion API error occurred: `{e.code}`. I might not have the right permissions for the page or its parent."
+            logger.error(f"Validation error details: {e.body}")
+            error_message += f"\nDetails: ```{e.body}```"
         app.client.chat_update(channel=channel_id, ts=thinking_message_ts, text=error_message)
     except Exception as e:
-        logger.error(f"An unexpected error occurred during Notion translation: {e}")
-        error_message = f":warning: An unexpected error occurred: ```{{e}}```"
+        logger.error(f"An unexpected error occurred during Notion translation: {e}", exc_info=True)
+        error_message = f":warning: An unexpected error occurred: ```{e}```"
         app.client.chat_update(channel=channel_id, ts=thinking_message_ts, text=error_message)
-
 
 @app.command("/translate-notion")
 def handle_translate_notion(ack, command, say, logger):
@@ -773,7 +763,7 @@ def handle_translate_notion(ack, command, say, logger):
 
     page_id = get_page_id_from_url(url)
     if not page_id:
-        say(text="I couldn't find a valid Page ID in that URL. Please check the link and try again.")
+        say(text="I couldn\'t find a valid Page ID in that URL. Please check the link and try again.")
         return
 
     thinking_message = say(text=f":hourglass_flowing_sand: Translating Notion page: <{url}>. This might take a moment...")
@@ -822,7 +812,7 @@ def analyze_image_from_url(image_url, logger, headers=None):
 1. Identify all distinct pieces of text in the image.
 2. For each piece of text, describe its approximate location (e.g., 'top center', 'bottom left banner').
 3. Provide the original text you identified.
-4. Translate the text. If it's Korean, translate to English. For all other languages, translate to Korean.
+4. Translate the text. If it\'s Korean, translate to English. For all other languages, translate to Korean.
 5. Present the result as a Slack message using markdown. If no text is found, state that clearly.
 
 Example Output:
@@ -914,10 +904,10 @@ Text to translate:
 
     except requests.exceptions.RequestException as e:
         logger.error(f"Error fetching URL {clean_url}: {e}")
-        return [{"type": "section", "text": {"type": "mrkdwn", "text": f":warning: Sorry, I couldn't fetch the content from <{clean_url}>."}}], None
+        return [{"type": "section", "text": {"type": "mrkdwn", "text": f":warning: Sorry, I couldn\'t fetch the content from <{clean_url}>."}}], None
     except Exception as e:
         logger.error(f"Error summarizing/translating URL {clean_url}: {e}")
-        return [{"type": "section", "text": {"type": "mrkdwn", "text": f":warning: Sorry, I couldn't summarize or translate the page at <{clean_url}>. Error: {e}"}}], None 
+        return [{"type": "section", "text": {"type": "mrkdwn", "text": f":warning: Sorry, I couldn\'t summarize or translate the page at <{clean_url}>. Error: {e}"}}], None 
 
 def handle_image_translation(file_obj, channel_id, thread_ts, say, logger, client):
     """Asks the user if they want to translate an image file."""
