@@ -156,3 +156,7 @@ translate-gem/registered_channels.json
 # Database files
 processed_news.db
 translate-gem/news-translation-error.txt
+
+# Excluded service directories
+slack-space-gemini/
+news-aggregator/

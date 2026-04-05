@@ -1,7 +1,0 @@
-slack_bolt
-python-dotenv
-google-cloud-aiplatform
-requests
-python-docx
-PyPDF2
-beautifulsoup4

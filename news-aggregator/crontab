@@ -1,4 +1,0 @@
-# 나중에 crontab -e 명령을 실행했을 때 이 파일의 내용을 복사하여 붙여넣으면 됨
-
-30 11 * * 1-5 /bin/bash -c 'cd /Users/nephilim/development/slack-gemini-bot && /Users/nephilim/development/slack-gemini-bot/news-aggregator/.venv/bin/python /Users/nephilim/development/slack-gemini-bot/news-aggregator/news-hound.py >> /Users/nephilim/development/slack-gemini-bot/news-aggregator/cron.log 2>&1'
-30 16 * * 1-5 /bin/bash -c 'cd /Users/nephilim/development/slack-gemini-bot && /Users/nephilim/development/slack-gemini-bot/news-aggregator/.venv/bin/python /Users/nephilim/development/slack-gemini-bot/news-aggregator/news-hound.py >> /Users/nephilim/development/slack-gemini-bot/news-aggregator/cron.log 2>&1'
