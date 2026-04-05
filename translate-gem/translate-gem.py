@@ -892,7 +892,7 @@ def handle_message_events(body, say, client, logger):
         return
     
     subtype = event.get("subtype")
-    if subtype in ["message_changed", "message_deleted"]:
+    if subtype in ["message_changed", "message_deleted", "channel_join", "channel_leave"]:
         return
 
     # --- Routing for Bot Messages ---
