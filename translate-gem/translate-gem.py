@@ -8,8 +8,7 @@ from urllib.parse import urljoin
 from dotenv import load_dotenv
 from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
-import vertexai
-from vertexai.generative_models import GenerativeModel, Part, GenerationConfig
+import anthropic
 import notion_client
 import requests
 from bs4 import BeautifulSoup
@@ -33,9 +32,12 @@ except Exception as e:
     logger.error(f"Error getting bot ID: {e}")
     BOT_ID = None
 
-# Vertex AI 초기화
-vertexai.init(project=os.environ.get("GOOGLE_CLOUD_PROJECT"), location=os.environ.get("GOOGLE_CLOUD_LOCATION"))
-model = GenerativeModel("gemini-2.5-flash")
+# Anthropic 클라이언트 초기화
+# TRANSLATION_MODEL 환경변수로 모델 변경 가능 (기본값: claude-haiku-4-5-20251001)
+# 예) TRANSLATION_MODEL=claude-sonnet-4-6 으로 설정하면 Sonnet 사용
+TRANSLATION_MODEL = os.environ.get("TRANSLATION_MODEL", "claude-haiku-4-5-20251001")
+anthropic_client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
+logger.info(f"Using translation model: {TRANSLATION_MODEL}")
 
 # Notion 클라이언트 초기화
 notion = notion_client.Client(auth=os.environ.get("NOTION_API_KEY"))
@@ -231,81 +233,6 @@ def ask_to_translate_title(say, channel, ts, page_id, original_title, new_title,
         ]
     )
 
-def ask_to_translate_image(say, channel_id, thread_ts, file_obj):
-    """Asks the user if they want to translate the image."""
-    file_name = file_obj.get('name')
-    file_id = file_obj.get('id')
-    
-    # Pass only the file_id to avoid exceeding the value length limit.
-    value_payload = json.dumps({"file_id": file_id})
-
-    say(
-        channel=channel_id,
-        thread_ts=thread_ts,
-        blocks=[
-            {
-                "type": "section",
-                "text": {
-                    "type": "mrkdwn",
-                    "text": f"An image (`{file_name}`) was attached. Would you like me to analyze it and translate any text found within?"
-                }
-            },
-            {
-                "type": "actions",
-                "elements": [
-                    {
-                        "type": "button",
-                        "text": {"type": "plain_text", "text": "✅ Yes, translate"},
-                        "style": "primary",
-                        "action_id": "translate_image_confirm",
-                        "value": value_payload
-                    },
-                    {
-                        "type": "button",
-                        "text": {"type": "plain_text", "text": "No"},
-                        "style": "danger",
-                        "action_id": "translate_image_cancel"
-                    }
-                ]
-            }
-        ]
-    )
-
-def ask_to_translate_og_image(say, channel_id, thread_ts, og_image_url, source_url):
-    """Asks the user if they want to translate the og:image."""
-    value_payload = json.dumps({"og_image_url": og_image_url})
-
-    say(
-        channel=channel_id,
-        thread_ts=thread_ts,
-        blocks=[
-            {
-                "type": "section",
-                "text": {
-                    "type": "mrkdwn",
-                    "text": f"🖼️ A preview image was found for <{source_url}>. Would you like me to analyze it and translate any text found within?"
-                }
-            },
-            {
-                "type": "actions",
-                "elements": [
-                    {
-                        "type": "button",
-                        "text": {"type": "plain_text", "text": "✅ Yes, translate"},
-                        "style": "primary",
-                        "action_id": "translate_og_image_confirm",
-                        "value": value_payload
-                    },
-                    {
-                        "type": "button",
-                        "text": {"type": "plain_text", "text": "No"},
-                        "style": "danger",
-                        "action_id": "translate_image_cancel" # We can reuse the cancel action
-                    }
-                ]
-            }
-        ]
-    )
 
 @app.action("translate_title_cancel")
 def handle_translate_title_cancel(ack, body):
@@ -374,115 +301,6 @@ def handle_translate_title_confirm(ack, body, say, logger):
             text=f":warning: An error occurred while updating the Notion page title: ```{e}```"
         )
 
-@app.action("translate_image_cancel")
-def handle_translate_image_cancel(ack, body, logger):
-    ack()
-    try:
-        app.client.chat_delete(channel=body['channel']['id'], ts=body['message']['ts'])
-    except Exception as e:
-        logger.error(f"Error deleting image translation prompt: {e}")
-
-def _process_image_translation(channel_id, original_ts, image_url, image_name, logger, headers=None):
-    """A helper function to process image translation and update Slack messages."""
-    try:
-        # Update message to "thinking" and remove buttons
-        app.client.chat_update(
-            channel=channel_id,
-            ts=original_ts,
-            blocks=[
-                {
-                    "type": "section",
-                    "text": {
-                        "type": "mrkdwn",
-                        "text": f":camera_with_flash: Analyzing image `{image_name}`... this may take a moment."
-                    }
-                }
-            ],
-            text="Analyzing image..."
-        )
-
-        analysis_result = analyze_image_from_url(image_url, logger, headers=headers)
-
-        # Update message with the final result
-        app.client.chat_update(
-            channel=channel_id,
-            ts=original_ts,
-            blocks=[], # clear blocks
-            text=analysis_result
-        )
-        logger.info(f"Successfully posted image translation for {image_name}")
-
-    except Exception as e:
-        logger.error(f"Error in _process_image_translation for {image_name}: {e}")
-        app.client.chat_update(
-            channel=channel_id,
-            ts=original_ts,
-            blocks=[],
-            text=f":warning: An error occurred while processing the image translation: ```{e}```"
-        )
-
-@app.action("translate_image_confirm")
-def handle_translate_image_confirm(ack, body, logger):
-    ack()
-    action_details = json.loads(body['actions'][0]['value'])
-    file_id = action_details['file_id']
-    
-    original_ts = body['message']['ts']
-    channel_id = body['channel']['id']
-
-    try:
-        # 1. Get file info using the file_id
-        logger.info(f"Fetching file info for file_id: {file_id}")
-        file_info_response = app.client.files_info(file=file_id)
-        if not file_info_response.get("ok"):
-            error_msg = file_info_response.get('error', 'Unknown error')
-            logger.error(f"Failed to get file info for {file_id}: {error_msg}")
-            app.client.chat_update(
-                channel=channel_id,
-                ts=original_ts,
-                blocks=[],
-                text=f":warning: Could not get image details to start translation. Error: `{error_msg}`"
-            )
-            return
-        
-        file_obj = file_info_response.get('file')
-        image_url = file_obj.get('url_private_download')
-        image_name = file_obj.get('name')
-        headers = {'Authorization': f'Bearer {os.environ.get("SLACK_BOT_TOKEN")}'}
-
-        if not image_url:
-            logger.error("No private download URL found for the image.")
-            app.client.chat_update(
-                channel=channel_id,
-                ts=original_ts,
-                blocks=[],
-                text=":warning: Could not translate image. No download URL found."
-            )
-            return
-
-        _process_image_translation(channel_id, original_ts, image_url, image_name, logger, headers=headers)
-
-    except Exception as e:
-        logger.error(f"Error in handle_translate_image_confirm: {e}")
-        app.client.chat_update(
-            channel=channel_id,
-            ts=original_ts,
-            blocks=[],
-            text=f":warning: An error occurred while processing the image translation: ```{e}```"
-        )
-
-@app.action("translate_og_image_confirm")
-def handle_translate_og_image_confirm(ack, body, logger):
-    ack()
-    action_details = json.loads(body['actions'][0]['value'])
-    og_image_url = action_details['og_image_url']
-    
-    original_ts = body['message']['ts']
-    channel_id = body['channel']['id']
-    
-    image_name = f"preview image from <{og_image_url}>"
-    _process_image_translation(channel_id, original_ts, og_image_url, image_name, logger)
-
 
 
 # Notion Page Translation Functions
@@ -521,14 +339,17 @@ Text to translate:
 {cleaned_text}
 '''
     try:
-        generation_config = GenerationConfig(max_output_tokens=2048)
-        response = model.generate_content(prompt, generation_config=generation_config)
-        
-        if not response.candidates or not response.candidates[0].content.parts:
-            logger.warning(f"Translation result was empty for target language {target_language}. It might have been blocked.")
+        response = anthropic_client.messages.create(
+            model=TRANSLATION_MODEL,
+            max_tokens=2048,
+            messages=[{"role": "user", "content": prompt}]
+        )
+
+        if not response.content:
+            logger.warning(f"Translation result was empty for target language {target_language}.")
             return "[Translation failed or was blocked by safety filters]"
-        
-        return response.text.strip()
+
+        return response.content[0].text.strip()
     except Exception as e:
         logger.error(f"Error during text chunk translation to {target_language}: {e}")
         return f"[Translation Error] {e}"
@@ -558,14 +379,17 @@ Text to translate:
 """
 
     try:
-        generation_config = GenerationConfig(max_output_tokens=8192)
-        response = model.generate_content(prompt, generation_config=generation_config)
-        
-        if not response.candidates or not response.candidates[0].content.parts:
-            logger.warning(f"Batch translation result was empty for target language {target_language}. It might have been blocked.")
+        response = anthropic_client.messages.create(
+            model=TRANSLATION_MODEL,
+            max_tokens=8192,
+            messages=[{"role": "user", "content": prompt}]
+        )
+
+        if not response.content:
+            logger.warning(f"Batch translation result was empty for target language {target_language}.")
             return ["[Translation failed or was blocked by safety filters]"] * len(texts)
-        
-        response_text = response.text
+
+        response_text = response.content[0].text
         translated_texts = response_text.split(separator)
 
         # Trim leading/trailing whitespace that might result from the split
@@ -693,7 +517,11 @@ def process_notion_translation(page_id, url, channel_id, thinking_message_ts, lo
         is_candidate = re.search(r'[가-힣]', original_title) and not (re.search(r'[a-zA-Z]', original_title) and ('/' in original_title or re.search(r'\s*\([^)]+\)', original_title)))
         if target_language == "English" and is_candidate:
             prompt = f"Translate the following Korean document title to English. Respond with only the translated title. Title: '{original_title}'"
-            english_title = model.generate_content(prompt).text.strip().replace('"', '')
+            english_title = anthropic_client.messages.create(
+                model=TRANSLATION_MODEL,
+                max_tokens=256,
+                messages=[{"role": "user", "content": prompt}]
+            ).content[0].text.strip().replace('"', '')
             new_title = f"{original_title} ({english_title})"
         else:
             new_title = f"{original_title}{new_title_suffix}"
@@ -789,60 +617,6 @@ def handle_translate_notion_jp(ack, command, say, logger):
     
     process_notion_translation(page_id, url, command['channel_id'], thinking_message['ts'], logger, target_language="Japanese")
 
-def analyze_image_from_url(image_url, logger, headers=None):
-    """
-    Downloads an image from a URL, analyzes it with Gemini, and returns the analysis.
-    Returns the analysis text or an error string.
-    """
-    logger.info(f"Analyzing image from URL: {image_url}")
-    try:
-        response = requests.get(image_url, headers=headers or {}, timeout=20)
-        response.raise_for_status()
-
-        content_type = response.headers.get('Content-Type', '')
-        if not content_type.startswith('image/'):
-            logger.warning(f"URL did not return an image. Content-Type: {content_type}")
-            return f":warning: The link ({image_url}) did not lead to a direct image file."
-
-        image_data = response.content
-        
-        image_part = Part.from_data(data=image_data, mime_type=content_type)
-        
-        prompt = """You are a visual translation expert. Your task is to analyze the provided image and perform the following tasks:
-1. Identify all distinct pieces of text in the image.
-2. For each piece of text, describe its approximate location (e.g., 'top center', 'bottom left banner').
-3. Provide the original text you identified.
-4. Translate the text. If it\'s Korean, translate to English. For all other languages, translate to Korean.
-5. Present the result as a Slack message using markdown. If no text is found, state that clearly.
-
-Example Output:
----
-🖼️ *Image Text Analysis & Translation*
-
-*Location:* Top-left corner
-> *Original:* 안녕하세요
-> *Translation:* Hello
-
-*Location:* Bottom, inside a blue button
-> *Original:* Click Here
-> *Translation:* 여기를 클릭하세요
----
-"""
-        
-        response = model.generate_content([image_part, prompt])
-        analysis_text = response.text.strip()
-
-        if not analysis_text:
-            return "I analyzed the image but could not find any text to translate."
-        
-        return analysis_text
-
-    except requests.exceptions.RequestException as e:
-        logger.error(f"Failed to download image from {image_url}: {e}")
-        return f":warning: Could not download the image from the link to analyze it."
-    except Exception as e:
-        logger.error(f"Error analyzing image from {image_url} with Gemini: {e}")
-        return f":warning: An error occurred while analyzing the image from the link."
 
 def create_url_summary_blocks(clean_url, logger):
     """
@@ -869,8 +643,11 @@ def create_url_summary_blocks(clean_url, logger):
         summarization_prompt = f'''Please summarize the following article text in its original language. Focus on the main points and key information, and keep the summary concise, within 350 characters.
             Article Text:
             {page_text[:4000]}'''
-        summary_response = model.generate_content(summarization_prompt)
-        summary_text = summary_response.text.strip()
+        summary_text = anthropic_client.messages.create(
+            model=TRANSLATION_MODEL,
+            max_tokens=1024,
+            messages=[{"role": "user", "content": summarization_prompt}]
+        ).content[0].text.strip()
 
         # 3. 요약문 번역
         translation_prompt = f'''You are a professional translator. Detect the language of the following text and translate it.
@@ -880,7 +657,11 @@ def create_url_summary_blocks(clean_url, logger):
 
 Text to translate:
 {summary_text}'''
-        translated_summary = model.generate_content(translation_prompt).text.strip()
+        translated_summary = anthropic_client.messages.create(
+            model=TRANSLATION_MODEL,
+            max_tokens=1024,
+            messages=[{"role": "user", "content": translation_prompt}]
+        ).content[0].text.strip()
         
         # 4. 블록 키트 메시지 구성
         blocks = [
@@ -909,15 +690,6 @@ Text to translate:
         logger.error(f"Error summarizing/translating URL {clean_url}: {e}")
         return [{"type": "section", "text": {"type": "mrkdwn", "text": f":warning: Sorry, I couldn\'t summarize or translate the page at <{clean_url}>. Error: {e}"}}], None 
 
-def handle_image_translation(file_obj, channel_id, thread_ts, say, logger, client):
-    """Asks the user if they want to translate an image file."""
-    mimetype = file_obj.get('mimetype', '')
-    if not mimetype.startswith('image/'):
-        logger.debug(f"Skipping non-image file: {file_obj.get('name')}")
-        return
-
-    logger.info(f"Detected image file, asking for translation: {file_obj.get('name')} in channel {channel_id}")
-    ask_to_translate_image(say, channel_id, thread_ts, file_obj)
 
 def translate_message(event, say, client, logger):
     """ 
@@ -989,8 +761,12 @@ def translate_message(event, say, client, logger):
 Text to translate:
 {full_text_to_translate}
 '''
-            translation_response = model.generate_content(prompt)
-            translated_text_with_placeholders = translation_response.text.strip()
+            translation_response = anthropic_client.messages.create(
+                model=TRANSLATION_MODEL,
+                max_tokens=2048,
+                messages=[{"role": "user", "content": prompt}]
+            )
+            translated_text_with_placeholders = translation_response.content[0].text.strip()
 
             final_translated_text = translated_text_with_placeholders
             for placeholder, url in placeholders.items():
@@ -1027,8 +803,12 @@ Text to translate:
                             is_candidate = re.search(r'[가-힣]', original_title) and not (re.search(r'[a-zA-Z]', original_title) and ('/' in original_title or re.search(r'\s*\([^)]+\)', original_title)))
                             if is_candidate:
                                 prompt = f"Translate the following Korean document title to English. Respond with only the translated title, without any additional text or quotation marks. Title: '{original_title}'"
-                                title_translation_response = model.generate_content(prompt)
-                                english_title = title_translation_response.text.strip()
+                                title_translation_response = anthropic_client.messages.create(
+                                    model=TRANSLATION_MODEL,
+                                    max_tokens=256,
+                                    messages=[{"role": "user", "content": prompt}]
+                                )
+                                english_title = title_translation_response.content[0].text.strip()
                                 new_title_format = f"{original_title} ({english_title})"
                                 ask_to_translate_title(say, channel_id, thread_for_follow_ups, page_id, original_title, new_title_format, title_prop_name, clean_url)
                     except Exception as e:
@@ -1038,8 +818,6 @@ Text to translate:
                 summary_blocks, og_image_url = create_url_summary_blocks(clean_url, logger)
                 if summary_blocks:
                     say(channel=channel_id, thread_ts=thread_for_follow_ups, blocks=summary_blocks, unfurl_links=False)
-                if og_image_url:
-                    ask_to_translate_og_image(say, channel_id, thread_for_follow_ups, og_image_url, clean_url)
 
     except Exception as e:
         logger.error(f"Error during translation process: {e}")
@@ -1141,12 +919,6 @@ def handle_message_events(body, say, client, logger):
             logger.info(f"--- New User Text Event Received --- \nTEXT: {event.get('text')}")
             translate_message(event, say, client, logger)
 
-        # Handle file attachments if they exist
-        if 'files' in event:
-            logger.info(f"--- New User File Event Received ---")
-            thread_ts = event.get('thread_ts') or event.get('ts')
-            for file_obj in event['files']:
-                handle_image_translation(file_obj, channel_id, thread_ts, say, logger, client)
 
 
 if __name__ == "__main__":

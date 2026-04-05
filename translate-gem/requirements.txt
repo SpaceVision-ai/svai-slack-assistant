@@ -1,4 +1,6 @@
 slack_bolt
 python-dotenv
-google-cloud-aiplatform
+anthropic
 notion-client
+requests
+beautifulsoup4
