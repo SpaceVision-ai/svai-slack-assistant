@@ -10,7 +10,7 @@ from urllib.parse import urljoin
 from dotenv import load_dotenv
 from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
-import anthropic
+from openai import OpenAI
 import notion_client
 import requests
 from bs4 import BeautifulSoup
@@ -34,11 +34,11 @@ except Exception as e:
     logger.error(f"Error getting bot ID: {e}")
     BOT_ID = None
 
-# Anthropic 클라이언트 초기화
-# TRANSLATION_MODEL 환경변수로 모델 변경 가능 (기본값: claude-haiku-4-5-20251001)
-# 예) TRANSLATION_MODEL=claude-sonnet-4-6 으로 설정하면 Sonnet 사용
-TRANSLATION_MODEL = os.environ.get("TRANSLATION_MODEL", "claude-haiku-4-5-20251001")
-anthropic_client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
+# OpenAI 클라이언트 초기화
+# TRANSLATION_MODEL 환경변수로 모델 변경 가능 (기본값: gpt-4o-mini)
+# 예) TRANSLATION_MODEL=gpt-4o 으로 설정하면 GPT-4o 사용
+TRANSLATION_MODEL = os.environ.get("TRANSLATION_MODEL", "gpt-4o-mini")
+openai_client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
 logger.info(f"Using translation model: {TRANSLATION_MODEL}")
 
 # Notion 클라이언트 초기화
@@ -341,17 +341,17 @@ Text to translate:
 {cleaned_text}
 '''
     try:
-        response = anthropic_client.messages.create(
+        response = openai_client.chat.completions.create(
             model=TRANSLATION_MODEL,
             max_tokens=2048,
             messages=[{"role": "user", "content": prompt}]
         )
 
-        if not response.content:
+        if not response.choices or not response.choices[0].message.content:
             logger.warning(f"Translation result was empty for target language {target_language}.")
             return "[Translation failed or was blocked by safety filters]"
 
-        return response.content[0].text.strip()
+        return response.choices[0].message.content.strip()
     except Exception as e:
         logger.error(f"Error during text chunk translation to {target_language}: {e}")
         return f"[Translation Error] {e}"
@@ -381,17 +381,17 @@ Text to translate:
 """
 
     try:
-        response = anthropic_client.messages.create(
+        response = openai_client.chat.completions.create(
             model=TRANSLATION_MODEL,
             max_tokens=8192,
             messages=[{"role": "user", "content": prompt}]
         )
 
-        if not response.content:
+        if not response.choices or not response.choices[0].message.content:
             logger.warning(f"Batch translation result was empty for target language {target_language}.")
             return ["[Translation failed or was blocked by safety filters]"] * len(texts)
 
-        response_text = response.content[0].text
+        response_text = response.choices[0].message.content
         translated_texts = response_text.split(separator)
 
         # Trim leading/trailing whitespace that might result from the split
@@ -519,11 +519,11 @@ def process_notion_translation(page_id, url, channel_id, thinking_message_ts, lo
         is_candidate = re.search(r'[가-힣]', original_title) and not (re.search(r'[a-zA-Z]', original_title) and ('/' in original_title or re.search(r'\s*\([^)]+\)', original_title)))
         if target_language == "English" and is_candidate:
             prompt = f"Translate the following Korean document title to English. Respond with only the translated title. Title: '{original_title}'"
-            english_title = anthropic_client.messages.create(
+            english_title = openai_client.chat.completions.create(
                 model=TRANSLATION_MODEL,
                 max_tokens=256,
                 messages=[{"role": "user", "content": prompt}]
-            ).content[0].text.strip().replace('"', '')
+            ).choices[0].message.content.strip().replace('"', '')
             new_title = f"{original_title} ({english_title})"
         else:
             new_title = f"{original_title}{new_title_suffix}"
@@ -659,11 +659,11 @@ TRANSLATION: <translated summary>
 
 Article Text:
 {page_text[:4000]}'''
-        combined_response = anthropic_client.messages.create(
+        combined_response = openai_client.chat.completions.create(
             model=TRANSLATION_MODEL,
             max_tokens=1024,
             messages=[{"role": "user", "content": summarize_and_translate_prompt}]
-        ).content[0].text.strip()
+        ).choices[0].message.content.strip()
 
         # 응답 파싱
         summary_text = ""
@@ -775,12 +775,12 @@ def translate_message(event, say, client, logger):
 Text to translate:
 {full_text_to_translate}
 '''
-            translation_response = anthropic_client.messages.create(
+            translation_response = openai_client.chat.completions.create(
                 model=TRANSLATION_MODEL,
                 max_tokens=2048,
                 messages=[{"role": "user", "content": prompt}]
             )
-            translated_text_with_placeholders = translation_response.content[0].text.strip()
+            translated_text_with_placeholders = translation_response.choices[0].message.content.strip()
 
             final_translated_text = translated_text_with_placeholders
             for placeholder, url in placeholders.items():
@@ -817,12 +817,12 @@ Text to translate:
                             is_candidate = re.search(r'[가-힣]', original_title) and not (re.search(r'[a-zA-Z]', original_title) and ('/' in original_title or re.search(r'\s*\([^)]+\)', original_title)))
                             if is_candidate:
                                 prompt = f"Translate the following Korean document title to English. Respond with only the translated title, without any additional text or quotation marks. Title: '{original_title}'"
-                                title_translation_response = anthropic_client.messages.create(
+                                title_translation_response = openai_client.chat.completions.create(
                                     model=TRANSLATION_MODEL,
                                     max_tokens=256,
                                     messages=[{"role": "user", "content": prompt}]
                                 )
-                                english_title = title_translation_response.content[0].text.strip()
+                                english_title = title_translation_response.choices[0].message.content.strip()
                                 new_title_format = f"{original_title} ({english_title})"
                                 ask_to_translate_title(say, channel_id, thread_for_follow_ups, page_id, original_title, new_title_format, title_prop_name, clean_url)
                     except Exception as e:

@@ -1,6 +1,6 @@
 slack_bolt
 python-dotenv
-anthropic
+openai
 notion-client
 requests
 beautifulsoup4
