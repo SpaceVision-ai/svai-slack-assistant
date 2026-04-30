@@ -1,55 +1,92 @@
-# Slack Gemini Bot
+# SVAI Slack Assistant
 
-This project is a Slack bot that integrates with Google's Gemini AI through Vertex AI. It allows users to interact with the Gemini model directly from Slack for various tasks like answering questions, analyzing attached files, and summarizing conversation histories.
+SpaceVision AI의 Slack 봇 모음입니다. 현재 운영 중인 서비스는 **Translate Gem**입니다.
 
-## Features
+## 프로젝트 구조
 
-- **Direct Interaction**: Mention the bot in a channel or send it a Direct Message (DM) to ask questions.
-- **Multimodal Analysis**: Attach files (Images, PDFs, DOCX, TXT, etc.) along with your question, and the bot will analyze their content to provide context-aware answers.
-- **Conversation Summarization**: Ask the bot to summarize the recent conversation in a channel to quickly catch up on discussions.
-- **Formatted Responses**: Bot responses are formatted using Slack's Block Kit for better readability.
-- **Handles Long Responses**: If Gemini's response is too long for a single Slack message, it's automatically sent as a downloadable Markdown file.
-
-## Setup
-
-### 1. Clone the Repository
-```bash
-git clone <your-repository-url>
-cd slack-gemini-bot
+```
+svai-slack-assistant/
+├── translate-gem/
+│   ├── translate-gem.py        # 실시간 번역 봇
+│   ├── translate-gem.service   # systemd 서비스 파일
+│   ├── requirements.txt
+│   └── docs/                   # 기능 명세 및 사용 가이드
+├── docs/                       # 인프라 및 봇 설정 가이드
+└── .venv/                      # 공용 가상환경
 ```
 
-### 2. Create a Virtual Environment
+> `slack-space-gemini/`, `news-aggregator/`는 별도로 관리되며 git 추적에서 제외됩니다.
+
+---
+
+## Translate Gem
+
+등록된 Slack 채널의 메시지를 **한국어 ↔ 영어** 자동 번역하여 원본 메시지의 스레드에 게시합니다.  
+Anthropic Claude(`claude-haiku-4-5-20251001` 기본값)를 번역 엔진으로 사용합니다.
+
+### 주요 기능
+
+- **실시간 번역**: 등록 채널의 메시지를 감지해 반대 언어로 번역 후 스레드에 게시
+- **Notion 페이지 번역**: 채널에 공유된 Notion URL을 감지하여 한국어 제목 페이지를 영어로 번역 제안
+- **URL 요약**: 일반 URL 공유 시 페이지 내용을 원문 요약 + 번역 요약으로 스레드에 게시 (병렬 처리)
+- **슬래시 커맨드**:
+  - `/translate-gem-channel add/remove/list` — 채널 번역 활성화/비활성화/목록 조회
+  - `/translate-notion` — Notion 페이지 전체 한→영 번역
+  - `/translate-notion-jp` — Notion 페이지 전체 한→일 번역
+
+### 설정
+
+#### 1. 가상환경 및 의존성 설치
+
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
+pip install -r translate-gem/requirements.txt
 ```
 
-### 3. Install Dependencies
+#### 2. 환경변수 설정
+
+`translate-gem/.env` 파일 생성:
+
+```env
+SLACK_APP_TOKEN=xapp-...
+SLACK_BOT_TOKEN=xoxb-...
+ANTHROPIC_API_KEY=sk-ant-...
+NOTION_API_KEY=ntn_...
+```
+
+번역 모델 변경이 필요한 경우 루트 `.env` 또는 시스템 환경변수에 추가:
+
+```env
+TRANSLATION_MODEL=claude-sonnet-4-6
+```
+
+#### 3. 실행
+
+**직접 실행:**
 ```bash
-pip install -r requirements.txt
+cd translate-gem
+python translate-gem.py
 ```
 
-### 4. Configure Environment Variables
-
-Create a `.env` file by copying the example file:
-
+**systemd 서비스로 실행 (운영):**
 ```bash
-cp .env.example .env
+sudo cp translate-gem/translate-gem.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable translate-gem
+sudo systemctl start translate-gem
 ```
 
-Now, edit the `.env` file and fill in the required credentials:
+### Slack 앱 설정
 
-- `SLACK_BOT_TOKEN`: Your Slack bot token (starts with `xoxb-`).
-- `SLACK_APP_TOKEN`: Your Slack app-level token (starts with `xapp-`).
-- `GOOGLE_CLOUD_PROJECT`: Your Google Cloud Project ID.
-- `GOOGLE_CLOUD_LOCATION`: The GCP region for Vertex AI (e.g., `us-central1`).
+봇 설정 방법은 [`docs/slack-bot-setting-guide.md`](docs/slack-bot-setting-guide.md)를 참고하세요.
 
-## Running the Bot
+---
 
-To start the bot on your local machine, run:
+## 참고 문서
 
-```bash
-python main.py
-```
-
-The bot will connect to Slack using Socket Mode and will be ready for interaction.
+- [`docs/slack-bot-setting-guide.md`](docs/slack-bot-setting-guide.md) — Slack OAuth 권한 및 Event Subscriptions 설정
+- [`docs/gemini-automated-code-assistant-guide.md`](docs/gemini-automated-code-assistant-guide.md) — GCP VM 기반 GitHub Actions 자동 코드 리뷰 구축 가이드
+- [`translate-gem/docs/PRD.md`](translate-gem/docs/PRD.md) — 번역 봇 기능 명세
+- [`translate-gem/docs/user_guide_KR.md`](translate-gem/docs/user_guide_KR.md) — 사용자 가이드 (한국어)
+- [`translate-gem/docs/user_guide_EN.md`](translate-gem/docs/user_guide_EN.md) — 사용자 가이드 (English)
