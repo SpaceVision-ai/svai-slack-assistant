@@ -4,6 +4,8 @@ import json
 import random
 import re
 import time
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import urljoin
 from dotenv import load_dotenv
 from slack_bolt import App
@@ -625,8 +627,12 @@ def create_url_summary_blocks(clean_url, logger):
     """
     try:
         # 1. 웹페이지 콘텐츠 추출
-        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/58.0.3029.110 Safari/537.3'}
-        response = requests.get(clean_url, headers=headers, timeout=10)
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.5',
+        }
+        response = requests.get(clean_url, headers=headers, timeout=5)
         response.raise_for_status()
         soup = BeautifulSoup(response.content, 'html.parser')
 
@@ -638,32 +644,40 @@ def create_url_summary_blocks(clean_url, logger):
             logger.info(f"Found og:image for {clean_url}: {og_image_url}")
 
         page_text = soup.get_text(separator='\n', strip=True)
-        
-        # 2. 텍스트 요약
-        summarization_prompt = f'''Please summarize the following article text in its original language. Focus on the main points and key information, and keep the summary concise, within 350 characters.
-            Article Text:
-            {page_text[:4000]}'''
-        summary_text = anthropic_client.messages.create(
+
+        # 2. 요약 + 번역을 단일 API 호출로 처리
+        summarize_and_translate_prompt = f'''You are a professional summarizer and translator. Given the article text below, do the following in a single response:
+
+1. Summarize the article in its original language. Keep it concise, within 350 characters.
+2. Translate that summary:
+   - If the summary is in Korean, translate it to English.
+   - For all other languages, translate it to Korean.
+
+Respond in exactly this format (no extra text):
+SUMMARY: <summary in original language>
+TRANSLATION: <translated summary>
+
+Article Text:
+{page_text[:4000]}'''
+        combined_response = anthropic_client.messages.create(
             model=TRANSLATION_MODEL,
             max_tokens=1024,
-            messages=[{"role": "user", "content": summarization_prompt}]
+            messages=[{"role": "user", "content": summarize_and_translate_prompt}]
         ).content[0].text.strip()
 
-        # 3. 요약문 번역
-        translation_prompt = f'''You are a professional translator. Detect the language of the following text and translate it.
-- If it is Korean, translate it to English.
-- For all other languages, translate it to Korean.
-- Provide only the raw, translated text.
+        # 응답 파싱
+        summary_text = ""
+        translated_summary = ""
+        for line in combined_response.splitlines():
+            if line.startswith("SUMMARY:"):
+                summary_text = line[len("SUMMARY:"):].strip()
+            elif line.startswith("TRANSLATION:"):
+                translated_summary = line[len("TRANSLATION:"):].strip()
+        # 파싱 실패 시 전체 응답을 번역으로 사용
+        if not translated_summary:
+            translated_summary = combined_response
 
-Text to translate:
-{summary_text}'''
-        translated_summary = anthropic_client.messages.create(
-            model=TRANSLATION_MODEL,
-            max_tokens=1024,
-            messages=[{"role": "user", "content": translation_prompt}]
-        ).content[0].text.strip()
-        
-        # 4. 블록 키트 메시지 구성
+        # 3. 블록 키트 메시지 구성
         blocks = [
             {
                 "type": "section",
@@ -680,15 +694,15 @@ Text to translate:
                 }
             }
         ]
-        
+
         return blocks, og_image_url
 
     except requests.exceptions.RequestException as e:
-        logger.error(f"Error fetching URL {clean_url}: {e}")
-        return [{"type": "section", "text": {"type": "mrkdwn", "text": f":warning: Sorry, I couldn\'t fetch the content from <{clean_url}>."}}], None
+        logger.warning(f"Skipping URL summary (fetch failed) {clean_url}: {e}")
+        return [], None
     except Exception as e:
         logger.error(f"Error summarizing/translating URL {clean_url}: {e}")
-        return [{"type": "section", "text": {"type": "mrkdwn", "text": f":warning: Sorry, I couldn\'t summarize or translate the page at <{clean_url}>. Error: {e}"}}], None 
+        return [], None
 
 
 def translate_message(event, say, client, logger):
@@ -780,12 +794,12 @@ Text to translate:
             for warning in warnings_to_post_as_reply:
                 say(channel=channel_id, text=warning, thread_ts=translation_thread_ts)
 
-        # 후속 조치: 모든 경우에 대해 일반/Notion URL 처리
+        # 후속 조치: URL 처리를 백그라운드 스레드에서 병렬 실행
         thread_for_follow_ups = translation_thread_ts or (thinking_response and thinking_response.get('ts')) or original_ts
-        
-        for url in urls_in_message:
+
+        def process_single_url(url):
             clean_url = url.strip('<>').split('|')[0]
-            
+
             if 'notion.so' in clean_url or 'notion.site' in clean_url:
                 page_id = get_page_id_from_url(clean_url)
                 if page_id:
@@ -797,7 +811,7 @@ Text to translate:
                             if prop_details.get('type') == 'title':
                                 title_property, title_prop_name = prop_details, prop_name
                                 break
-                        
+
                         if title_property and title_prop_name:
                             original_title = title_property.get('title', [{}])[0].get('plain_text', 'Untitled')
                             is_candidate = re.search(r'[가-힣]', original_title) and not (re.search(r'[a-zA-Z]', original_title) and ('/' in original_title or re.search(r'\s*\([^)]+\)', original_title)))
@@ -818,6 +832,12 @@ Text to translate:
                 summary_blocks, og_image_url = create_url_summary_blocks(clean_url, logger)
                 if summary_blocks:
                     say(channel=channel_id, thread_ts=thread_for_follow_ups, blocks=summary_blocks, unfurl_links=False)
+
+        if urls_in_message:
+            def run_url_processing():
+                with ThreadPoolExecutor(max_workers=min(len(urls_in_message), 5)) as executor:
+                    executor.map(process_single_url, urls_in_message)
+            threading.Thread(target=run_url_processing, daemon=True).start()
 
     except Exception as e:
         logger.error(f"Error during translation process: {e}")
