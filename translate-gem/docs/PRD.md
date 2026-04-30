@@ -4,26 +4,26 @@
 
 - **프로젝트명:** Project Mentalese
 - **목표:** Slack 채널의 메시지를 실시간으로 감지하여 지정된 언어(한국어 ↔ 영어)로 자동 번역하고, 그 결과를 원본 메시지의 스레드에 게시하여 다국어 사용자 간의 원활한 소통을 지원한다.
-- **사용 모델:** Vertex AI `gemini-2.5-flash`
+- **사용 모델:** Anthropic Claude (`claude-haiku-4-5-20251001` 기본값, 환경변수 `TRANSLATION_MODEL`로 변경 가능)
 
 ## 2. 핵심 기능 요구사항
 
 ### 2.1. 번역 채널 관리
 
 - **채널 등록:**
-    - 사용자는 슬래시 명령어 `/translate-gem add`를 통해 특정 채널을 실시간 번역 대상으로 등록할 수 있다.
+    - 사용자는 슬래시 명령어 `/translate-gem-channel add`를 통해 특정 채널을 실시간 번역 대상으로 등록할 수 있다.
     - 등록 시, 봇은 "This channel is now enabled for real-time translation."와 같은 확인 메시지를 해당 채널에 전송한다.
 - **채널 삭제:**
-    - 사용자는 슬래시 명령어 `/translate-gem remove`를 통해 해당 채널의 실시간 번역 기능을 중지할 수 있다.
+    - 사용자는 슬래시 명령어 `/translate-gem-channel remove`를 통해 해당 채널의 실시간 번역 기능을 중지할 수 있다.
     - 중지 시, 봇은 "Real-time translation has been disabled for this channel."와 같은 확인 메시지를 전송한다.
 - **채널 목록 확인:**
-    - 사용자는 슬래시 명령어 `/translate-gem list`를 통해 현재 번역이 활성화된 모든 채널의 목록을 확인할 수 있다.
+    - 사용자는 슬래시 명령어 `/translate-gem-channel list`를 통해 현재 번역이 활성화된 모든 채널의 목록을 확인할 수 있다.
 
 ### 2.2. 실시간 메시지 번역
 
 - **대상:** 등록된 채널에 게시되는 모든 신규 메시지 및 스레드(댓글) 메시지
 - **번역 규칙:**
-    - Vertex AI의 Gemini 모델을 사용하여 메시지가 한국어인지 영어인지 판단하고, 반대 언어로 번역한다.
+    - Anthropic Claude를 사용하여 메시지가 한국어인지 영어인지 판단하고, 반대 언어로 번역한다.
     - **프롬프트 예시 (영어로 번역 시):** `Translate the following Korean text to English: [Original Message]`
     - **프롬프트 예시 (한국어로 번역 시):** `Translate the following English text to Korean: [Original Message]`
 - **결과 게시:**
@@ -42,10 +42,10 @@
     - `main.py`, `requirements.txt`, `.env` 등 기본 파일 구성
 2.  **채널 관리 기능 구현:**
     - 번역 대상 채널 목록을 저장할 JSON 파일(`registered_channels.json`) 시스템 구축
-    - `/translate-gem` 슬래시 명령어 및 하위 명령어(add, remove, list) 로직 구현
+    - `/translate-gem-channel` 슬래시 명령어 및 하위 명령어(add, remove, list) 로직 구현
 3.  **실시간 번역 기능 구현:**
     - `message` 이벤트 리스너를 통해 등록된 채널의 모든 메시지 감지
-    - Vertex AI (`gemini-2.5-flash`)를 연동하여 언어 감지 및 번역 수행
+    - Anthropic Claude API를 연동하여 언어 감지 및 번역 수행
     - 번역 결과를 원본 메시지의 스레드에 게시하는 로직 구현
 
 ## 5. (신규) Notion 문서 번역 기능
@@ -63,7 +63,7 @@
 4.  봇은 "Notion 문서 번역을 시작합니다..." 와 같은 상태 메시지로 업데이트한다.
 5.  봇은 백그라운드에서 다음 작업을 수행한다:
     a. Notion API를 사용하여 원본 문서의 모든 블록(콘텐츠)을 가져온다.
-    b. Gemini API를 호출하여 가져온 콘텐츠 전체를 번역한다.
+    b. Anthropic Claude API를 호출하여 가져온 콘텐츠 전체를 번역한다.
     c. Notion API를 사용하여 원본 문서와 동일한 위치(부모 페이지)에 새로운 페이지를 생성한다.
     d. 새 페이지의 제목은 원본 제목에 `(번역)`을 붙여 만든다. (예: "Meeting Notes" -> "Meeting Notes (번역)")
     e. 번역된 콘텐츠 블록을 새 페이지에 채워 넣는다.
@@ -77,14 +77,14 @@
     - **필요 권한:** 페이지 읽기, 페이지/블록 생성 및 수정
     - **핵심 로직: "블록 단위 번역 및 재구성"**
         1.  `blocks.children.list`를 통해 원본 페이지의 모든 블록 객체를 **구조와 서식을 유지한 채** 가져온다.
-        2.  가져온 블록 리스트를 순회하며, `paragraph`, `heading_1/2/3`, `bulleted_list_item` 등 텍스트 기반 블록의 `rich_text` 내용만 추출하여 Gemini API로 번역한다.
+        2.  가져온 블록 리스트를 순회하며, `paragraph`, `heading_1/2/3`, `bulleted_list_item` 등 텍스트 기반 블록의 `rich_text` 내용만 추출하여 Anthropic Claude API로 번역한다.
         3.  번역된 텍스트를 원본 블록과 **동일한 타입과 서식(`annotations`)**을 가진 새로운 블록 객체로 재구성한다.
         4.  `divider`, `image` 등 비-텍스트 블록은 번역 없이 그대로 복제한다.
         5.  `pages.create`로 번역될 페이지를 생성한 후, `blocks.children.append`를 사용해 재구성된 블록 리스트 전체를 새 페이지에 추가한다.
 - **Slack Block Kit:**
     - 사용자에게 확인을 받기 위한 버튼 컴포넌트 구현
     - 버튼 클릭과 같은 상호작용(Interaction)을 처리하기 위한 로직 구현
-- **Gemini API:**
+- **Anthropic Claude API:**
     - 대량의 텍스트(문서 전체)를 번역하기 위한 API 호출 로직
 
 ### 5.4. 제약 사항
@@ -93,5 +93,5 @@
     - 이 "블록 단위 번역" 접근법을 통해 **제목, 목록, 인용, 굵게, 기울임 등 대부분의 주요 서식은 보존**됩니다.
     - 단, **테이블(Table), 인라인 데이터베이스(Database), 콜아웃(Callout), 싱크 블록(Synced Block)** 등 복잡한 구조의 블록은 초기 버전에서는 완벽한 번역을 지원하지 않을 수 있습니다. 이 경우, 해당 블록은 원본 그대로 복사되거나, 텍스트 부분만 번역될 수 있습니다.
 - **API 호출 최적화:**
-    - 문서의 길이에 따라 다수의 블록을 번역해야 하므로, 여러 블록의 텍스트를 하나의 배치(batch)로 묶어 Gemini API에 요청하여 API 호출 횟수를 최적화하는 로직이 필요합니다.
+    - 문서의 길이에 따라 다수의 블록을 번역해야 하므로, 여러 블록의 텍스트를 하나의 배치(batch)로 묶어 Anthropic Claude API에 요청하여 API 호출 횟수를 최적화하는 로직이 필요합니다.
     - API 호출에 시간이 소요될 수 있으므로, 사용자에게 작업이 진행 중임을 명확히 알려주는 것이 중요합니다.

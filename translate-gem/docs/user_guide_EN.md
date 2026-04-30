@@ -5,7 +5,7 @@ Translate-Gem is a bot that provides real-time message translation in Slack chan
 ## 1. Basic Translation Features
 
 - **Automatic Language Detection and Translation**: Korean messages are translated into English, and all other languages (e.g., English, Japanese) are translated into Korean.
-- **Translation Progress Indicator**: Since the bot uses Google's `gemini-2.5-flash` model internally, there may be a short delay of a few seconds for translation. A waiting message will be displayed while the translation is in progress.
+- **Translation Progress Indicator**: Since the bot uses Anthropic's `claude-haiku-4-5-20251001` model internally, there may be a short delay of a few seconds for translation. A waiting message will be displayed while the translation is in progress.
 - **Clear Author Attribution**: The translated message always mentions the original author, so it's clear who wrote the message.
 - **Response Method by Channel/DM Type**:
     - **Public/Private Channels**: The translation is posted as a reply in the original message's thread.
@@ -15,11 +15,11 @@ Translate-Gem is a bot that provides real-time message translation in Slack chan
 
 You can enable or disable real-time translation in channels where the bot has been invited using specific commands.
 
-- **Enable Translation**: ` /translate-channel add `
+- **Enable Translation**: ` /translate-gem-channel add `
   - All messages in the channel will now be translated in real-time.
-- **Disable Translation**: ` /translate-channel remove `
+- **Disable Translation**: ` /translate-gem-channel remove `
   - Real-time translation will be stopped.
-- **List Active Channels**: ` /translate-channel list `
+- **List Active Channels**: ` /translate-gem-channel list `
   - Shows a list of all channels where translation is currently active.
 
 ## 3. Usage in Direct Messages (DMs)
